@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
+      font-size: 12px;
+      margin: 0;
+      padding: 16px;
+      color: #1e1e1e;
+    }
+    h2 {
+      margin: 0 0 12px 0;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .section-label {
+      margin: 16px 0 8px 0;
+      font-size: 11px;
+      font-weight: 600;
+      color: #555;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .buttons {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    button {
+      background: #18a0fb;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 14px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      width: 100%;
+    }
+    button:hover:not(:disabled) { background: #0d8de4; }
+    button:active:not(:disabled) { background: #0c7fcc; }
+    button:disabled {
+      background: #e5e5e5;
+      color: #aaa;
+      cursor: not-allowed;
+    }
+    .nav-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+    .nav-btn {
+      padding: 8px 0;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 12px;
+      user-select: none;
+      cursor: pointer;
+    }
+    .toggle-row input {
+      position: absolute;
+      opacity: 0;
+      width: 0;
+      height: 0;
+      pointer-events: none;
+    }
+    .toggle-track {
+      position: relative;
+      flex-shrink: 0;
+      width: 28px;
+      height: 16px;
+      background: #c4c4c4;
+      border-radius: 8px;
+      transition: background 0.15s ease;
+    }
+    .toggle-thumb {
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 12px;
+      height: 12px;
+      background: #fff;
+      border-radius: 50%;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+      transition: left 0.15s ease;
+    }
+    .toggle-row input:checked ~ .toggle-track {
+      background: #18a0fb;
+    }
+    .toggle-row input:checked ~ .toggle-track .toggle-thumb {
+      left: 14px;
+    }
+    #status {
+      margin-top: 12px;
+      padding: 10px;
+      background: #f5f5f5;
+      border-radius: 6px;
+      min-height: 18px;
+      color: #333;
+      font-size: 11px;
+    }
+    #status.empty { color: #888; }
+    #status.error { background: #fef0f0; color: #b91c1c; }
+  </style>
+</head>
+<body>
+  <h2>TableMaster</h2>
+
+  <div class="buttons">
+    <button id="select-row">Выделить строку</button>
+    <button id="select-column">Выделить столбец</button>
+    <button id="select-all" disabled>Выделить все ячейки</button>
+  </div>
+
+  <label class="toggle-row">
+    <input type="checkbox" id="include-header" />
+    <span class="toggle-track"><span class="toggle-thumb"></span></span>
+    <span>Включать заголовок</span>
+  </label>
+
+  <div class="section-label">Навигация</div>
+  <div class="nav-row">
+    <button class="nav-btn" id="nav-prev-col" disabled title="Сдвинуть столбец влево">←</button>
+    <button class="nav-btn" id="nav-next-col" disabled title="Сдвинуть столбец вправо">→</button>
+    <button class="nav-btn" id="nav-prev-row" disabled title="Сдвинуть строку вверх">↑</button>
+    <button class="nav-btn" id="nav-next-row" disabled title="Сдвинуть строку вниз">↓</button>
+  </div>
+
+  <div class="section-label">Расширение</div>
+  <div class="nav-row">
+    <button class="nav-btn" id="exp-col-left" disabled title="Расширить столбцом слева">+←</button>
+    <button class="nav-btn" id="exp-col-right" disabled title="Расширить столбцом справа">+→</button>
+    <button class="nav-btn" id="exp-row-up" disabled title="Расширить строкой сверху">+↑</button>
+    <button class="nav-btn" id="exp-row-down" disabled title="Расширить строкой снизу">+↓</button>
+  </div>
+
+  <div class="section-label">Добавить</div>
+  <div class="nav-row">
+    <button class="nav-btn" id="add-col-left" disabled title="Дублировать крайний левый столбец выделения и вставить слева">←Стб</button>
+    <button class="nav-btn" id="add-col-right" disabled title="Дублировать крайний правый столбец выделения и вставить справа">Стб→</button>
+    <button class="nav-btn" id="add-row-up" disabled title="Дублировать верхнюю строку выделения и вставить сверху">↑Стр</button>
+    <button class="nav-btn" id="add-row-down" disabled title="Дублировать нижнюю строку выделения и вставить снизу">Стр↓</button>
+  </div>
+
+  <div id="status" class="empty">Выделите ячейку таблицы</div>
+
+  <script>
+    const btnRow = document.getElementById('select-row');
+    const btnCol = document.getElementById('select-column');
+    const btnAll = document.getElementById('select-all');
+    const cbHeader = document.getElementById('include-header');
+    const navPrevCol = document.getElementById('nav-prev-col');
+    const navNextCol = document.getElementById('nav-next-col');
+    const navPrevRow = document.getElementById('nav-prev-row');
+    const navNextRow = document.getElementById('nav-next-row');
+    const expColLeft = document.getElementById('exp-col-left');
+    const expColRight = document.getElementById('exp-col-right');
+    const expRowUp = document.getElementById('exp-row-up');
+    const expRowDown = document.getElementById('exp-row-down');
+    const addColLeft = document.getElementById('add-col-left');
+    const addColRight = document.getElementById('add-col-right');
+    const addRowUp = document.getElementById('add-row-up');
+    const addRowDown = document.getElementById('add-row-down');
+    const status = document.getElementById('status');
+
+    function send(payload) {
+      parent.postMessage({ pluginMessage: payload }, '*');
+    }
+    function header() { return cbHeader.checked; }
+
+    btnRow.addEventListener('click', () => send({ type: 'select-row' }));
+    btnCol.addEventListener('click', () => send({ type: 'select-column', includeHeader: header() }));
+    btnAll.addEventListener('click', () => send({ type: 'select-all', includeHeader: header() }));
+
+    navPrevCol.addEventListener('click', () => send({ type: 'nav', mode: 'column', direction: 'prev', includeHeader: header() }));
+    navNextCol.addEventListener('click', () => send({ type: 'nav', mode: 'column', direction: 'next', includeHeader: header() }));
+    navPrevRow.addEventListener('click', () => send({ type: 'nav', mode: 'row', direction: 'prev' }));
+    navNextRow.addEventListener('click', () => send({ type: 'nav', mode: 'row', direction: 'next' }));
+
+    expColLeft.addEventListener('click', () => send({ type: 'expand', mode: 'column', direction: 'prev', includeHeader: header() }));
+    expColRight.addEventListener('click', () => send({ type: 'expand', mode: 'column', direction: 'next', includeHeader: header() }));
+    expRowUp.addEventListener('click', () => send({ type: 'expand', mode: 'row', direction: 'prev' }));
+    expRowDown.addEventListener('click', () => send({ type: 'expand', mode: 'row', direction: 'next' }));
+
+    cbHeader.addEventListener('change', () => send({ type: 'toggle-header', includeHeader: cbHeader.checked }));
+
+    addColLeft.addEventListener('click', () => send({ type: 'add', mode: 'column', direction: 'prev' }));
+    addColRight.addEventListener('click', () => send({ type: 'add', mode: 'column', direction: 'next' }));
+    addRowUp.addEventListener('click', () => send({ type: 'add', mode: 'row', direction: 'prev' }));
+    addRowDown.addEventListener('click', () => send({ type: 'add', mode: 'row', direction: 'next' }));
+
+    window.onmessage = (event) => {
+      const msg = event.data.pluginMessage;
+      if (!msg) return;
+
+      if (msg.type === 'status') {
+        status.textContent = msg.message;
+        status.classList.remove('empty', 'error');
+        if (!msg.ok) status.classList.add('error');
+      } else if (msg.type === 'nav-state') {
+        navPrevCol.disabled = !msg.canPrevCol;
+        navNextCol.disabled = !msg.canNextCol;
+        navPrevRow.disabled = !msg.canPrevRow;
+        navNextRow.disabled = !msg.canNextRow;
+        expColLeft.disabled = !msg.canExpColLeft;
+        expColRight.disabled = !msg.canExpColRight;
+        expRowUp.disabled = !msg.canExpRowUp;
+        expRowDown.disabled = !msg.canExpRowDown;
+        btnAll.disabled = !msg.canSelectAll;
+        addColLeft.disabled = !msg.canAddColLeft;
+        addColRight.disabled = !msg.canAddColRight;
+        addRowUp.disabled = !msg.canAddRowUp;
+        addRowDown.disabled = !msg.canAddRowDown;
+      } else if (msg.type === 'init-state') {
+        // Программная установка .checked не вызывает change event — toggle-header не сработает
+        cbHeader.checked = !!msg.includeHeader;
+      }
+    };
+
+    send({ type: 'init' });
+  </script>
+</body>
+</html>

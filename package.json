@@ -1,0 +1,13 @@
+{
+  "name": "table-master",
+  "version": "0.1.0",
+  "description": "Figma plugin: TableMaster",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "*",
+    "typescript": "*"
+  }
+}
