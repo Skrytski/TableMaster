@@ -678,6 +678,9 @@ function addColumnGrid(model: TableModel, anchorColIdx: number, direction: "prev
 function addColumn(direction: "prev" | "next"): Response {
   const ctx = getContext();
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
+  if (ctx.model.type === "grid") {
+    return { ok: false, message: "Добавление в grid-таблицах пока не поддерживается" };
+  }
 
   const sel = figma.currentPage.selection;
   let anchorColIdx: number | null = null;
@@ -694,9 +697,7 @@ function addColumn(direction: "prev" | "next"): Response {
   }
   if (anchorColIdx === null) return { ok: false, message: "Не найден столбец-якорь" };
 
-  const newCells = ctx.model.type === "grid"
-    ? addColumnGrid(ctx.model, anchorColIdx, direction)
-    : addColumnStack(ctx.model, anchorColIdx, direction);
+  const newCells = addColumnStack(ctx.model, anchorColIdx, direction);
 
   if (newCells.length === 0) return { ok: false, message: "Не удалось продублировать" };
   figma.currentPage.selection = newCells;
@@ -760,6 +761,9 @@ function addRowGrid(model: TableModel, anchorRowIdx: number, direction: "prev" |
 function addRow(direction: "prev" | "next"): Response {
   const ctx = getContext();
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
+  if (ctx.model.type === "grid") {
+    return { ok: false, message: "Добавление в grid-таблицах пока не поддерживается" };
+  }
 
   const sel = figma.currentPage.selection;
   let anchorRowIdx: number | null = null;
@@ -780,9 +784,7 @@ function addRow(direction: "prev" | "next"): Response {
     return { ok: false, message: "Заголовок может быть только один" };
   }
 
-  const newCells = ctx.model.type === "grid"
-    ? addRowGrid(ctx.model, anchorRowIdx, direction)
-    : addRowStack(ctx.model, anchorRowIdx, direction);
+  const newCells = addRowStack(ctx.model, anchorRowIdx, direction);
 
   if (newCells.length === 0) return { ok: false, message: "Не удалось продублировать" };
   figma.currentPage.selection = newCells;
@@ -1046,6 +1048,10 @@ function computeNavState(): NavState {
 
   if (hasCell) state.canSelectAll = true;
 
+  // Add-кнопки только для stack-таблиц. Для grid Figma запрещает manual cell positioning
+  // когда GridAutoTracks активен — ждём, пока Figma выставит native API.
+  const isGrid = ctx !== null && ctx.model.type === "grid";
+
   const isHeaderRowIdx = (rowIdx: number): boolean => ctx !== null && rowIdx === ctx.model.headerRowIdx;
 
   const findEdgeRowIdxs = (): { top: number | null; bottom: number | null } => {
@@ -1063,7 +1069,7 @@ function computeNavState(): NavState {
   };
 
   if (cls.mode === "none") {
-    if (hasCell && sel.length === 1 && isVisible(sel[0])) {
+    if (hasCell && !isGrid && sel.length === 1 && isVisible(sel[0])) {
       const lc = ctx!.model.cellByNodeId.get(sel[0].id);
       if (lc) {
         const inHeader = isHeaderRowIdx(lc.rowIdx);
@@ -1094,24 +1100,20 @@ function computeNavState(): NavState {
     state.canExpRowDown = true;
   }
 
-  // Move-кнопки только для stack-таблиц. Для grid Figma запрещает manual cell positioning
-  // когда GridAutoTracks активен — ждём, пока Figma выставит native moveRow/moveColumn в API.
-  const isGrid = ctx !== null && ctx.model.type === "grid";
-
   if (cls.mode === "column") {
-    state.canAddColLeft = true;
-    state.canAddColRight = true;
     if (!isGrid) {
+      state.canAddColLeft = true;
+      state.canAddColRight = true;
       const leftVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "prev", null);
       const rightVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "next", null);
       state.canMoveColLeft = leftVal.ok;
       state.canMoveColRight = rightVal.ok;
     }
   } else if (cls.mode === "row") {
-    const edges = findEdgeRowIdxs();
-    state.canAddRowUp = edges.top !== null && !isHeaderRowIdx(edges.top);
-    state.canAddRowDown = edges.bottom !== null && !isHeaderRowIdx(edges.bottom);
     if (ctx && !isGrid) {
+      const edges = findEdgeRowIdxs();
+      state.canAddRowUp = edges.top !== null && !isHeaderRowIdx(edges.top);
+      state.canAddRowDown = edges.bottom !== null && !isHeaderRowIdx(edges.bottom);
       const headerPos = ctx.model.visibleRowIdxs.indexOf(ctx.model.headerRowIdx);
       const skipPos = headerPos >= 0 ? headerPos : null;
       const upVal = validateMoveBlock(cls.rowPositions, ctx.model.visibleRowIdxs, "prev", skipPos);
