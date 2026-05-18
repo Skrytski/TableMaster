@@ -945,78 +945,12 @@ function moveColumnStack(model: TableModel, rotation: Map<number, number>): bool
   return true;
 }
 
-// Для grid с GridAutoTracks Figma запрещает setGridChildPosition. Доступны только
-// appendChild (auto-place в первую свободную ячейку по auto-flow row-major).
-// Алгоритм: detach все ячейки, которые должны переехать, в currentPage; затем
-// appendChild их обратно в правильном target row-major порядке. Auto-flow auto-tracks
-// расставляет их по освободившимся позициям ровно туда, куда нужно.
-function moveCellsViaAutoFlow(
-  body: FrameNode,
-  involvedCells: LogicalCell[],
-  rotation: Map<number, number>,
-  axis: "row" | "column",
-  visibleRowIdxs: number[],
-  visibleColIdxs: number[],
-): void {
-  // Lookup ячейки по (rowIdx, colIdx)
-  const cellByPos = new Map<string, SceneNode>();
-  for (const lc of involvedCells) {
-    cellByPos.set(`${lc.rowIdx},${lc.colIdx}`, lc.node);
-  }
-  // Обратная карта: target idx → source idx
-  const sourceOfTarget = new Map<number, number>();
-  for (const [src, tgt] of rotation) sourceOfTarget.set(tgt, src);
-
-  // Detach все задействованные ячейки
-  for (const lc of involvedCells) {
-    figma.currentPage.appendChild(lc.node);
-  }
-
-  // AppendChild в target row-major порядке
-  if (axis === "row") {
-    // moveRow: rotation по rowIdx. Target rows в порядке возрастания. Внутри каждого — все colIdx по порядку.
-    const targetRowsAsc = [...new Set(rotation.keys())].sort((a, b) => a - b);
-    for (const targetRow of targetRowsAsc) {
-      const sourceRow = sourceOfTarget.get(targetRow);
-      if (sourceRow === undefined) continue;
-      for (const colIdx of visibleColIdxs) {
-        const cell = cellByPos.get(`${sourceRow},${colIdx}`);
-        if (cell) body.appendChild(cell);
-      }
-    }
-  } else {
-    // moveColumn: rotation по colIdx. Идём построчно (row-major) по ВСЕМ строкам,
-    // в каждой строке выкладываем involved target cols по порядку.
-    const targetColsAsc = [...new Set(rotation.keys())].sort((a, b) => a - b);
-    for (const rowIdx of visibleRowIdxs) {
-      for (const targetCol of targetColsAsc) {
-        const sourceCol = sourceOfTarget.get(targetCol);
-        if (sourceCol === undefined) continue;
-        const cell = cellByPos.get(`${rowIdx},${sourceCol}`);
-        if (cell) body.appendChild(cell);
-      }
-    }
-  }
-}
-
-function moveColumnGrid(model: TableModel, rotation: Map<number, number>): boolean {
-  const body = model.body as FrameNode;
-  const involvedSet = new Set([...rotation.keys()]);
-  const involvedCells = model.cells.filter((lc) => involvedSet.has(lc.colIdx));
-  if (involvedCells.length === 0) return false;
-
-  try {
-    moveCellsViaAutoFlow(body, involvedCells, rotation, "column", model.visibleRowIdxs, model.visibleColIdxs);
-    return true;
-  } catch (e) {
-    figma.notify(`Ошибка move column: ${String(e).slice(0, 100)}`, { error: true });
-    return false;
-  }
-}
-
 function moveColumn(direction: "prev" | "next"): Response {
   const ctx = getContext();
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
+  if (ctx.model.type === "grid") {
+    return { ok: false, message: "Перемещение в grid-таблицах пока не поддерживается" };
+  }
   const cls = classifySelection();
   if (cls.mode !== "column") return { ok: false, message: "Выделите столбец" };
   const validate = validateMoveBlock(cls.colPositions, ctx.model.visibleColIdxs, direction, null);
@@ -1026,9 +960,7 @@ function moveColumn(direction: "prev" | "next"): Response {
     ? buildWrapRotationMap(ctx.model.visibleColIdxs, validate.blockIdxs, direction)
     : buildRotationMap(validate.blockIdxs, validate.neighborIdx, direction);
 
-  const ok = ctx.model.type === "grid"
-    ? moveColumnGrid(ctx.model, rotation)
-    : moveColumnStack(ctx.model, rotation);
+  const ok = moveColumnStack(ctx.model, rotation);
 
   if (!ok) return { ok: false, message: "Не удалось переместить" };
   refreshCache();
@@ -1061,24 +993,12 @@ function moveRowStack(model: TableModel, rotation: Map<number, number>): boolean
   return true;
 }
 
-function moveRowGrid(model: TableModel, rotation: Map<number, number>): boolean {
-  const body = model.body as FrameNode;
-  const involvedSet = new Set([...rotation.keys()]);
-  const involvedCells = model.cells.filter((lc) => involvedSet.has(lc.rowIdx));
-  if (involvedCells.length === 0) return false;
-
-  try {
-    moveCellsViaAutoFlow(body, involvedCells, rotation, "row", model.visibleRowIdxs, model.visibleColIdxs);
-    return true;
-  } catch (e) {
-    figma.notify(`Ошибка move row: ${String(e).slice(0, 100)}`, { error: true });
-    return false;
-  }
-}
-
 function moveRow(direction: "prev" | "next"): Response {
   const ctx = getContext();
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
+  if (ctx.model.type === "grid") {
+    return { ok: false, message: "Перемещение в grid-таблицах пока не поддерживается" };
+  }
   const cls = classifySelection();
   if (cls.mode !== "row") return { ok: false, message: "Выделите строку" };
 
@@ -1097,9 +1017,7 @@ function moveRow(direction: "prev" | "next"): Response {
     rotation = buildRotationMap(validate.blockIdxs, validate.neighborIdx, direction);
   }
 
-  const ok = ctx.model.type === "grid"
-    ? moveRowGrid(ctx.model, rotation)
-    : moveRowStack(ctx.model, rotation);
+  const ok = moveRowStack(ctx.model, rotation);
 
   if (!ok) return { ok: false, message: "Не удалось переместить" };
   refreshCache();
@@ -1176,18 +1094,24 @@ function computeNavState(): NavState {
     state.canExpRowDown = true;
   }
 
+  // Move-кнопки только для stack-таблиц. Для grid Figma запрещает manual cell positioning
+  // когда GridAutoTracks активен — ждём, пока Figma выставит native moveRow/moveColumn в API.
+  const isGrid = ctx !== null && ctx.model.type === "grid";
+
   if (cls.mode === "column") {
     state.canAddColLeft = true;
     state.canAddColRight = true;
-    const leftVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "prev", null);
-    const rightVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "next", null);
-    state.canMoveColLeft = leftVal.ok;
-    state.canMoveColRight = rightVal.ok;
+    if (!isGrid) {
+      const leftVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "prev", null);
+      const rightVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "next", null);
+      state.canMoveColLeft = leftVal.ok;
+      state.canMoveColRight = rightVal.ok;
+    }
   } else if (cls.mode === "row") {
     const edges = findEdgeRowIdxs();
     state.canAddRowUp = edges.top !== null && !isHeaderRowIdx(edges.top);
     state.canAddRowDown = edges.bottom !== null && !isHeaderRowIdx(edges.bottom);
-    if (ctx) {
+    if (ctx && !isGrid) {
       const headerPos = ctx.model.visibleRowIdxs.indexOf(ctx.model.headerRowIdx);
       const skipPos = headerPos >= 0 ? headerPos : null;
       const upVal = validateMoveBlock(cls.rowPositions, ctx.model.visibleRowIdxs, "prev", skipPos);
