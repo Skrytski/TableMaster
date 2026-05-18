@@ -636,51 +636,39 @@ function addColumnStack(model: TableModel, anchorColIdx: number, direction: "pre
   return newCells;
 }
 
+// Для GridAutoTracks="ROWS": setGridChildPosition запрещён, но insertChild и
+// gridColumnCount разрешены. Вставляем клоны в нужные позиции массива детей,
+// рассчитанные так, чтобы после изменения gridColumnCount раскладка совпала.
+// Порядок: сначала вставки (с конца, чтобы индексы не съезжали), затем +gridColumnCount.
 function addColumnGrid(model: TableModel, anchorColIdx: number, direction: "prev" | "next"): SceneNode[] {
   const body = model.body as FrameNode;
-  const K = anchorColIdx;
-  const newColIdx = direction === "next" ? K + 1 : K;
+  const C = body.gridColumnCount;
+  const newColIdx = direction === "next" ? anchorColIdx + 1 : anchorColIdx;
+  const N = model.allRowIdxs.length;
 
-  // 1. Расширить грид
-  body.gridColumnCount = body.gridColumnCount + 1;
+  const cellByPos = new Map<string, SceneNode>();
+  for (const lc of model.cells) cellByPos.set(`${lc.rowIdx},${lc.colIdx}`, lc.node);
 
-  // 2. Сдвинуть существующие ячейки. Для "next": сдвигаем те, у которых colIdx > K.
-  //    Для "prev": сдвигаем те, у которых colIdx >= K. По убыванию colIdx чтобы избежать конфликтов.
-  const shiftThreshold = direction === "next" ? K + 1 : K;
-  const toShift = model.cells
-    .filter((lc) => lc.colIdx >= shiftThreshold)
-    .sort((a, b) => b.colIdx - a.colIdx);
-  for (const lc of toShift) {
-    (lc.node as unknown as { setGridChildPosition: (r: number, c: number) => void })
-      .setGridChildPosition(lc.rowIdx, lc.colIdx + 1);
+  const clones: (SceneNode | null)[] = [];
+  for (let r = 0; r < N; r++) {
+    const src = cellByPos.get(`${r},${anchorColIdx}`);
+    clones.push(src ? src.clone() : null);
   }
 
-  // 3. Найти исходные ячейки. Для "next": они всё ещё на K. Для "prev": они теперь на K+1.
-  const sourceColAfterShift = direction === "next" ? K : K + 1;
-  const newCells: SceneNode[] = [];
-  for (const rowIdx of model.allRowIdxs) {
-    // Найти ячейку в данном ряду по текущему положению (после сдвига)
-    let sourceNode: SceneNode | null = null;
-    for (const c of body.children) {
-      const sc = c as SceneNode;
-      const r = (sc as unknown as { gridRowAnchorIndex?: number }).gridRowAnchorIndex;
-      const col = (sc as unknown as { gridColumnAnchorIndex?: number }).gridColumnAnchorIndex;
-      if (r === rowIdx && col === sourceColAfterShift) { sourceNode = sc; break; }
-    }
-    if (!sourceNode) continue;
-    const clone = sourceNode.clone();
-    body.appendChildAt(clone, rowIdx, newColIdx);
-    newCells.push(clone);
+  // Вставляем с конца, чтобы предыдущие индексы оставались валидными
+  for (let r = N - 1; r >= 0; r--) {
+    const clone = clones[r];
+    if (clone) body.insertChild(r * C + newColIdx, clone);
   }
-  return newCells;
+
+  body.gridColumnCount = C + 1;
+
+  return clones.filter((c): c is SceneNode => c !== null);
 }
 
 function addColumn(direction: "prev" | "next"): Response {
   const ctx = getContext();
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
-  if (ctx.model.type === "grid") {
-    return { ok: false, message: "Добавление в grid-таблицах пока не поддерживается" };
-  }
 
   const sel = figma.currentPage.selection;
   let anchorColIdx: number | null = null;
@@ -697,7 +685,9 @@ function addColumn(direction: "prev" | "next"): Response {
   }
   if (anchorColIdx === null) return { ok: false, message: "Не найден столбец-якорь" };
 
-  const newCells = addColumnStack(ctx.model, anchorColIdx, direction);
+  const newCells = ctx.model.type === "grid"
+    ? addColumnGrid(ctx.model, anchorColIdx, direction)
+    : addColumnStack(ctx.model, anchorColIdx, direction);
 
   if (newCells.length === 0) return { ok: false, message: "Не удалось продублировать" };
   figma.currentPage.selection = newCells;
@@ -723,36 +713,26 @@ function addRowStack(model: TableModel, anchorRowIdx: number, direction: "prev" 
   return [...(newRow as SceneNode & ChildrenMixin).children] as SceneNode[];
 }
 
+// Для GridAutoTracks="ROWS" gridRowCount менять запрещено — но рядов всё равно
+// добавляется автоматически по факту наличия детей. Просто вставляем C клонов
+// подряд по индексу newRowIdx * C — Figma сама создаст новый ряд.
 function addRowGrid(model: TableModel, anchorRowIdx: number, direction: "prev" | "next"): SceneNode[] {
   const body = model.body as FrameNode;
-  const K = anchorRowIdx;
-  const newRowIdx = direction === "next" ? K + 1 : K;
+  const C = body.gridColumnCount;
+  const newRowIdx = direction === "next" ? anchorRowIdx + 1 : anchorRowIdx;
 
-  body.gridRowCount = body.gridRowCount + 1;
-
-  // Сдвиг по строкам
-  const shiftThreshold = direction === "next" ? K + 1 : K;
-  const toShift = model.cells
-    .filter((lc) => lc.rowIdx >= shiftThreshold)
-    .sort((a, b) => b.rowIdx - a.rowIdx);
-  for (const lc of toShift) {
-    (lc.node as unknown as { setGridChildPosition: (r: number, c: number) => void })
-      .setGridChildPosition(lc.rowIdx + 1, lc.colIdx);
+  const cellByCol = new Map<number, SceneNode>();
+  for (const lc of model.cells) {
+    if (lc.rowIdx === anchorRowIdx) cellByCol.set(lc.colIdx, lc.node);
   }
 
-  const sourceRowAfterShift = direction === "next" ? K : K + 1;
+  const startIdx = newRowIdx * C;
   const newCells: SceneNode[] = [];
-  for (const colIdx of model.allColIdxs) {
-    let sourceNode: SceneNode | null = null;
-    for (const c of body.children) {
-      const sc = c as SceneNode;
-      const r = (sc as unknown as { gridRowAnchorIndex?: number }).gridRowAnchorIndex;
-      const col = (sc as unknown as { gridColumnAnchorIndex?: number }).gridColumnAnchorIndex;
-      if (r === sourceRowAfterShift && col === colIdx) { sourceNode = sc; break; }
-    }
-    if (!sourceNode) continue;
-    const clone = sourceNode.clone();
-    body.appendChildAt(clone, newRowIdx, colIdx);
+  for (let c = 0; c < C; c++) {
+    const src = cellByCol.get(c);
+    if (!src) continue;
+    const clone = src.clone();
+    body.insertChild(startIdx + c, clone);
     newCells.push(clone);
   }
   return newCells;
@@ -761,9 +741,6 @@ function addRowGrid(model: TableModel, anchorRowIdx: number, direction: "prev" |
 function addRow(direction: "prev" | "next"): Response {
   const ctx = getContext();
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
-  if (ctx.model.type === "grid") {
-    return { ok: false, message: "Добавление в grid-таблицах пока не поддерживается" };
-  }
 
   const sel = figma.currentPage.selection;
   let anchorRowIdx: number | null = null;
@@ -784,7 +761,9 @@ function addRow(direction: "prev" | "next"): Response {
     return { ok: false, message: "Заголовок может быть только один" };
   }
 
-  const newCells = addRowStack(ctx.model, anchorRowIdx, direction);
+  const newCells = ctx.model.type === "grid"
+    ? addRowGrid(ctx.model, anchorRowIdx, direction)
+    : addRowStack(ctx.model, anchorRowIdx, direction);
 
   if (newCells.length === 0) return { ok: false, message: "Не удалось продублировать" };
   figma.currentPage.selection = newCells;
@@ -1048,8 +1027,8 @@ function computeNavState(): NavState {
 
   if (hasCell) state.canSelectAll = true;
 
-  // Add-кнопки только для stack-таблиц. Для grid Figma запрещает manual cell positioning
-  // когда GridAutoTracks активен — ждём, пока Figma выставит native API.
+  // Move-кнопки только для stack-таблиц. Для grid Figma запрещает manual cell positioning
+  // когда GridAutoTracks активен — ждём, пока Figma выставит native moveRow/moveColumn в API.
   const isGrid = ctx !== null && ctx.model.type === "grid";
 
   const isHeaderRowIdx = (rowIdx: number): boolean => ctx !== null && rowIdx === ctx.model.headerRowIdx;
@@ -1069,7 +1048,7 @@ function computeNavState(): NavState {
   };
 
   if (cls.mode === "none") {
-    if (hasCell && !isGrid && sel.length === 1 && isVisible(sel[0])) {
+    if (hasCell && sel.length === 1 && isVisible(sel[0])) {
       const lc = ctx!.model.cellByNodeId.get(sel[0].id);
       if (lc) {
         const inHeader = isHeaderRowIdx(lc.rowIdx);
@@ -1101,19 +1080,19 @@ function computeNavState(): NavState {
   }
 
   if (cls.mode === "column") {
+    state.canAddColLeft = true;
+    state.canAddColRight = true;
     if (!isGrid) {
-      state.canAddColLeft = true;
-      state.canAddColRight = true;
       const leftVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "prev", null);
       const rightVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "next", null);
       state.canMoveColLeft = leftVal.ok;
       state.canMoveColRight = rightVal.ok;
     }
   } else if (cls.mode === "row") {
+    const edges = findEdgeRowIdxs();
+    state.canAddRowUp = edges.top !== null && !isHeaderRowIdx(edges.top);
+    state.canAddRowDown = edges.bottom !== null && !isHeaderRowIdx(edges.bottom);
     if (ctx && !isGrid) {
-      const edges = findEdgeRowIdxs();
-      state.canAddRowUp = edges.top !== null && !isHeaderRowIdx(edges.top);
-      state.canAddRowDown = edges.bottom !== null && !isHeaderRowIdx(edges.bottom);
       const headerPos = ctx.model.visibleRowIdxs.indexOf(ctx.model.headerRowIdx);
       const skipPos = headerPos >= 0 ? headerPos : null;
       const upVal = validateMoveBlock(cls.rowPositions, ctx.model.visibleRowIdxs, "prev", skipPos);
