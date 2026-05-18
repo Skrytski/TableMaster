@@ -1,4 +1,4 @@
-figma.showUI(__html__, { width: 280, height: 580 });
+figma.showUI(__html__, { width: 280, height: 700 });
 
 const X_TOLERANCE = 1;
 const MIN_ROWS_FOR_TABLE = 2;
@@ -15,7 +15,12 @@ type NavState = {
   canExpColRight: boolean;
   canExpRowUp: boolean;
   canExpRowDown: boolean;
+  canShrinkColLeft: boolean;
+  canShrinkColRight: boolean;
+  canShrinkRowUp: boolean;
+  canShrinkRowDown: boolean;
   canSelectAll: boolean;
+  canClearSelection: boolean;
   canAddColLeft: boolean;
   canAddColRight: boolean;
   canAddRowUp: boolean;
@@ -24,6 +29,15 @@ type NavState = {
   canMoveColRight: boolean;
   canMoveRowUp: boolean;
   canMoveRowDown: boolean;
+};
+
+// «Якорь» — память о том, какие ряды/столбцы пользователь подразумевал
+// последним действием. Сохраняется через цепочки nav, чтобы при смене оси
+// можно было вернуться к исходному столбцу/ряду.
+type AnchorState = {
+  rowIdxs: number[]; // sorted asc
+  colIdxs: number[]; // sorted asc
+  axis: "row" | "column" | null;
 };
 
 type Classification = {
@@ -293,6 +307,10 @@ function findTableContext(seed: SceneNode): TableContext | null {
 // ---------- cache ----------
 
 let cacheCtx: TableContext | null = null;
+let anchorState: AnchorState | null = null;
+// Если плагин сам менял selection — запоминаем какие id выставили,
+// чтобы при последующем selectionchange не сбрасывать anchorState.
+let lastPluginSelectionIds: Set<string> | null = null;
 
 function refreshCache(): void {
   const sel = figma.currentPage.selection;
@@ -301,6 +319,49 @@ function refreshCache(): void {
 
 function getContext(): TableContext | null {
   return cacheCtx;
+}
+
+function setPluginSelection(nodes: readonly SceneNode[]): void {
+  lastPluginSelectionIds = new Set(nodes.map((n) => n.id));
+  figma.currentPage.selection = [...nodes];
+}
+
+// Восстановить anchorState из текущего выделения. Вызывается при изменениях
+// выделения, которые сделал не плагин (т.е. пользователь сам кликнул).
+function refreshAnchorFromSelection(): void {
+  if (!cacheCtx) {
+    anchorState = null;
+    return;
+  }
+  const model = cacheCtx.model;
+  const sel = figma.currentPage.selection;
+
+  const lcs: LogicalCell[] = [];
+  for (const n of sel) {
+    if (!isVisible(n)) continue;
+    const lc = model.cellByNodeId.get(n.id);
+    if (lc && lc.visible) lcs.push(lc);
+  }
+  if (lcs.length === 0) {
+    anchorState = null;
+    return;
+  }
+
+  const rowSet = new Set<number>();
+  const colSet = new Set<number>();
+  for (const lc of lcs) {
+    rowSet.add(lc.rowIdx);
+    colSet.add(lc.colIdx);
+  }
+  const rowIdxs = [...rowSet].sort((a, b) => a - b);
+  const colIdxs = [...colSet].sort((a, b) => a - b);
+
+  const cls = classifySelection();
+  let axis: "row" | "column" | null = null;
+  if (cls.mode === "row") axis = "row";
+  else if (cls.mode === "column") axis = "column";
+
+  anchorState = { rowIdxs, colIdxs, axis };
 }
 
 // ---------- selection helpers ----------
@@ -443,7 +504,12 @@ function selectRow(): Response {
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
   const cells = cellsAtRow(ctx.model, ctx.logical.rowIdx, true);
   if (cells.length === 0) return { ok: false, message: "В строке нет видимых ячеек" };
-  figma.currentPage.selection = cells;
+  anchorState = {
+    rowIdxs: [ctx.logical.rowIdx],
+    colIdxs: [ctx.logical.colIdx],
+    axis: "row",
+  };
+  setPluginSelection(cells);
   return { ok: true, message: `Выделена строка: ${cells.length} ячеек` };
 }
 
@@ -452,7 +518,12 @@ function selectColumn(includeHeader: boolean): Response {
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
   const cells = cellsAtCol(ctx.model, ctx.logical.colIdx, true, includeHeader);
   if (cells.length === 0) return { ok: false, message: "В столбце ничего не найдено" };
-  figma.currentPage.selection = cells;
+  anchorState = {
+    rowIdxs: [ctx.logical.rowIdx],
+    colIdxs: [ctx.logical.colIdx],
+    axis: "column",
+  };
+  setPluginSelection(cells);
   return { ok: true, message: `Выделен столбец: ${cells.length} ячеек` };
 }
 
@@ -466,57 +537,169 @@ function selectAll(includeHeader: boolean): Response {
     result.push(lc.node);
   }
   if (result.length === 0) return { ok: false, message: "Нет видимых ячеек" };
-  figma.currentPage.selection = result;
+  anchorState = {
+    rowIdxs: [...ctx.model.visibleRowIdxs],
+    colIdxs: [...ctx.model.visibleColIdxs],
+    axis: null,
+  };
+  setPluginSelection(result);
   return { ok: true, message: `Все ячейки: ${result.length}` };
 }
 
 // ---------- actions: navigate ----------
 
+// Новая логика nav: первое нажатие в новой оси — трансформация выделения
+// (без сдвига) на основе anchorState; последующие нажатия в той же оси —
+// сдвиг. Между переключениями оси сохраняется память о rowIdxs/colIdxs,
+// чтобы возврат к оси шёл к исходным позициям.
 function navigate(mode: "column" | "row", direction: "prev" | "next", includeHeader: boolean): Response {
   const ctx = getContext();
-  if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
-  const cls = classifySelection();
-  const step = direction === "next" ? 1 : -1;
+  if (!ctx || !anchorState) return { ok: false, message: "Это не похоже на таблицу" };
   const model = ctx.model;
+  const step = direction === "next" ? 1 : -1;
 
-  if (mode === "column") {
-    if (cls.colPositions.length === 0 || cls.mode === "row") {
-      return { ok: false, message: "Выделите столбец" };
+  if (mode === "row") {
+    const totalRows = model.visibleRowIdxs.length;
+    if (totalRows === 0) return { ok: false, message: "Нет строк" };
+
+    if (anchorState.axis !== "row") {
+      // Трансформация: выделить ряды по anchor.rowIdxs.
+      // Если anchor только в header и includeHeader=off — переходим на следующий по направлению.
+      let target = [...anchorState.rowIdxs];
+      const allInHeader = target.length > 0 && target.every((r) => r === model.headerRowIdx);
+      if (!includeHeader && allInHeader) {
+        const posOf = new Map<number, number>();
+        model.visibleRowIdxs.forEach((idx, i) => posOf.set(idx, i));
+        const hPos = posOf.get(model.headerRowIdx);
+        if (hPos !== undefined) {
+          let attempts = totalRows;
+          let p = hPos;
+          while (attempts-- > 0) {
+            p = ((p + step) % totalRows + totalRows) % totalRows;
+            if (model.visibleRowIdxs[p] !== model.headerRowIdx) {
+              target = [model.visibleRowIdxs[p]];
+              break;
+            }
+          }
+        }
+      }
+      anchorState.rowIdxs = target;
+      anchorState.axis = "row";
+    } else {
+      // Сдвиг каждого ряда по anchorState.rowIdxs
+      const posOf = new Map<number, number>();
+      model.visibleRowIdxs.forEach((idx, i) => posOf.set(idx, i));
+      const newSet = new Set<number>();
+      for (const idx of anchorState.rowIdxs) {
+        const pos = posOf.get(idx);
+        if (pos === undefined) continue;
+        const newPos = ((pos + step) % totalRows + totalRows) % totalRows;
+        newSet.add(model.visibleRowIdxs[newPos]);
+      }
+      anchorState.rowIdxs = [...newSet].sort((a, b) => a - b);
     }
-    const totalCols = model.visibleColIdxs.length;
-    if (totalCols === 0) return { ok: false, message: "Нет столбцов" };
-    const newPos = cls.colPositions.map((p) => (((p + step) % totalCols) + totalCols) % totalCols);
+
     const seen = new Set<string>();
     const result: SceneNode[] = [];
-    for (const pos of newPos) {
-      const colIdx = model.visibleColIdxs[pos];
-      for (const c of cellsAtCol(model, colIdx, true, includeHeader)) {
+    for (const r of anchorState.rowIdxs) {
+      for (const c of cellsAtRow(model, r, true)) {
         if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
       }
     }
-    if (result.length === 0) return { ok: false, message: "Пусто" };
-    figma.currentPage.selection = result;
-    return { ok: true, message: `Столбец сдвинут: ${result.length} ячеек` };
+    if (result.length === 0) return { ok: false, message: "Нет ячеек" };
+    setPluginSelection(result);
+    return { ok: true, message: `Ряд${anchorState.rowIdxs.length > 1 ? "ы" : ""}: ${result.length} ячеек` };
   }
 
-  // row
-  if (cls.rowPositions.length === 0 || cls.mode === "column") {
-    return { ok: false, message: "Выделите строку" };
+  // mode === "column"
+  const totalCols = model.visibleColIdxs.length;
+  if (totalCols === 0) return { ok: false, message: "Нет столбцов" };
+
+  if (anchorState.axis !== "column") {
+    // Трансформация: используем anchor.colIdxs как есть.
+    anchorState.axis = "column";
+  } else {
+    const posOf = new Map<number, number>();
+    model.visibleColIdxs.forEach((idx, i) => posOf.set(idx, i));
+    const newSet = new Set<number>();
+    for (const idx of anchorState.colIdxs) {
+      const pos = posOf.get(idx);
+      if (pos === undefined) continue;
+      const newPos = ((pos + step) % totalCols + totalCols) % totalCols;
+      newSet.add(model.visibleColIdxs[newPos]);
+    }
+    anchorState.colIdxs = [...newSet].sort((a, b) => a - b);
   }
-  const totalRows = model.visibleRowIdxs.length;
-  if (totalRows === 0) return { ok: false, message: "Нет строк" };
-  const newPos = cls.rowPositions.map((p) => (((p + step) % totalRows) + totalRows) % totalRows);
+
   const seen = new Set<string>();
   const result: SceneNode[] = [];
-  for (const pos of newPos) {
-    const rowIdx = model.visibleRowIdxs[pos];
-    for (const c of cellsAtRow(model, rowIdx, true)) {
-      if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
+  for (const cIdx of anchorState.colIdxs) {
+    for (const cell of cellsAtCol(model, cIdx, true, includeHeader)) {
+      if (!seen.has(cell.id)) { seen.add(cell.id); result.push(cell); }
     }
   }
-  if (result.length === 0) return { ok: false, message: "Пусто" };
-  figma.currentPage.selection = result;
-  return { ok: true, message: `Строка сдвинута: ${result.length} ячеек` };
+  if (result.length === 0) return { ok: false, message: "Нет ячеек" };
+  setPluginSelection(result);
+  return { ok: true, message: `Столбц${anchorState.colIdxs.length > 1 ? "ы" : ""}: ${result.length} ячеек` };
+}
+
+// ---------- actions: shrink ----------
+
+function shrink(mode: "column" | "row", direction: "prev" | "next", includeHeader: boolean): Response {
+  const ctx = getContext();
+  if (!ctx || !anchorState) return { ok: false, message: "Это не похоже на таблицу" };
+  const model = ctx.model;
+
+  if (mode === "column") {
+    if (anchorState.colIdxs.length < 2) return { ok: false, message: "Не из чего сужать" };
+    const sorted = [...anchorState.colIdxs].sort((a, b) => a - b);
+    if (direction === "prev") sorted.shift();
+    else sorted.pop();
+    anchorState.colIdxs = sorted;
+  } else {
+    if (anchorState.rowIdxs.length < 2) return { ok: false, message: "Не из чего сужать" };
+    const sorted = [...anchorState.rowIdxs].sort((a, b) => a - b);
+    if (direction === "prev") sorted.shift();
+    else sorted.pop();
+    anchorState.rowIdxs = sorted;
+  }
+
+  const seen = new Set<string>();
+  const result: SceneNode[] = [];
+  if (anchorState.axis === "row") {
+    for (const r of anchorState.rowIdxs) {
+      for (const c of cellsAtRow(model, r, true)) {
+        if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
+      }
+    }
+  } else if (anchorState.axis === "column") {
+    for (const cIdx of anchorState.colIdxs) {
+      for (const cell of cellsAtCol(model, cIdx, true, includeHeader)) {
+        if (!seen.has(cell.id)) { seen.add(cell.id); result.push(cell); }
+      }
+    }
+  } else {
+    // axis == null → прямоугольник rowIdxs × colIdxs (берём только видимые ячейки)
+    const rowSet = new Set(anchorState.rowIdxs);
+    const colSet = new Set(anchorState.colIdxs);
+    for (const lc of model.cells) {
+      if (!lc.visible) continue;
+      if (!rowSet.has(lc.rowIdx) || !colSet.has(lc.colIdx)) continue;
+      if (!seen.has(lc.node.id)) { seen.add(lc.node.id); result.push(lc.node); }
+    }
+  }
+
+  if (result.length === 0) return { ok: false, message: "Пусто после сужения" };
+  setPluginSelection(result);
+  return { ok: true, message: `Сужено: ${result.length} ячеек` };
+}
+
+// ---------- actions: clear selection ----------
+
+function clearSelection(): Response {
+  anchorState = null;
+  setPluginSelection([]);
+  return { ok: true, message: "Выделение снято" };
 }
 
 // ---------- actions: expand ----------
@@ -543,7 +726,12 @@ function expand(mode: "column" | "row", direction: "prev" | "next", includeHeade
     for (const c of newCells) {
       if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
     }
-    figma.currentPage.selection = result;
+    if (anchorState) {
+      const colSet = new Set(anchorState.colIdxs);
+      colSet.add(colIdx);
+      anchorState.colIdxs = [...colSet].sort((a, b) => a - b);
+    }
+    setPluginSelection(result);
     return { ok: true, message: `Добавлен столбец: ${result.length} ячеек` };
   }
 
@@ -563,7 +751,12 @@ function expand(mode: "column" | "row", direction: "prev" | "next", includeHeade
   for (const c of newCells) {
     if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
   }
-  figma.currentPage.selection = result;
+  if (anchorState) {
+    const rowSet = new Set(anchorState.rowIdxs);
+    rowSet.add(rowIdx);
+    anchorState.rowIdxs = [...rowSet].sort((a, b) => a - b);
+  }
+  setPluginSelection(result);
   return { ok: true, message: `Добавлена строка: ${result.length} ячеек` };
 }
 
@@ -590,7 +783,7 @@ function toggleHeader(includeHeader: boolean): Response {
 
   if (!includeHeader) {
     const filtered = sel.filter((n) => !headerIds.has(n.id));
-    figma.currentPage.selection = filtered;
+    setPluginSelection(filtered);
     return { ok: true, message: `Заголовок убран: ${filtered.length} ячеек` };
   }
 
@@ -610,7 +803,7 @@ function toggleHeader(includeHeader: boolean): Response {
   for (const c of toAdd) {
     if (!seenIds.has(c.id)) result.push(c);
   }
-  figma.currentPage.selection = result;
+  setPluginSelection(result);
   return { ok: true, message: `Заголовок добавлен: ${result.length} ячеек` };
 }
 
@@ -690,7 +883,10 @@ function addColumn(direction: "prev" | "next"): Response {
     : addColumnStack(ctx.model, anchorColIdx, direction);
 
   if (newCells.length === 0) return { ok: false, message: "Не удалось продублировать" };
-  figma.currentPage.selection = newCells;
+  setPluginSelection(newCells);
+  // Anchor пересчитается из selectionchange, lastPluginSelectionIds выставлен —
+  // но новые узлы изменили структуру; принудительно сбросим, чтобы refreshAnchor отработал.
+  lastPluginSelectionIds = null;
   return { ok: true, message: `Добавлен столбец: ${newCells.length} ячеек` };
 }
 
@@ -766,7 +962,8 @@ function addRow(direction: "prev" | "next"): Response {
     : addRowStack(ctx.model, anchorRowIdx, direction);
 
   if (newCells.length === 0) return { ok: false, message: "Не удалось продублировать" };
-  figma.currentPage.selection = newCells;
+  setPluginSelection(newCells);
+  lastPluginSelectionIds = null;
   return { ok: true, message: `Добавлена строка: ${newCells.length} ячеек` };
 }
 
@@ -945,6 +1142,7 @@ function moveColumn(direction: "prev" | "next"): Response {
 
   if (!ok) return { ok: false, message: "Не удалось переместить" };
   refreshCache();
+  refreshAnchorFromSelection();
   return { ok: true, message: `Столбец перемещён ${direction === "next" ? "вправо" : "влево"}` };
 }
 
@@ -1014,7 +1212,10 @@ function computeNavState(): NavState {
     canPrevRow: false, canNextRow: false,
     canExpColLeft: false, canExpColRight: false,
     canExpRowUp: false, canExpRowDown: false,
+    canShrinkColLeft: false, canShrinkColRight: false,
+    canShrinkRowUp: false, canShrinkRowDown: false,
     canSelectAll: false,
+    canClearSelection: false,
     canAddColLeft: false, canAddColRight: false,
     canAddRowUp: false, canAddRowDown: false,
     canMoveColLeft: false, canMoveColRight: false,
@@ -1026,9 +1227,9 @@ function computeNavState(): NavState {
   const hasCell = ctx !== null;
 
   if (hasCell) state.canSelectAll = true;
+  if (sel.length > 0) state.canClearSelection = true;
 
-  // Move-кнопки только для stack-таблиц. Для grid Figma запрещает manual cell positioning
-  // когда GridAutoTracks активен — ждём, пока Figma выставит native moveRow/moveColumn в API.
+  // Move-кнопки только для stack-таблиц.
   const isGrid = ctx !== null && ctx.model.type === "grid";
 
   const isHeaderRowIdx = (rowIdx: number): boolean => ctx !== null && rowIdx === ctx.model.headerRowIdx;
@@ -1047,6 +1248,27 @@ function computeNavState(): NavState {
     return { top, bottom };
   };
 
+  // Nav: активны если есть anchor и это не "all" режим.
+  if (hasCell && anchorState && cls.mode !== "all") {
+    state.canPrevCol = true;
+    state.canNextCol = true;
+    state.canPrevRow = true;
+    state.canNextRow = true;
+  }
+
+  // Shrink: активны если в anchor минимум 2 ряда/столбца.
+  if (anchorState) {
+    if (anchorState.colIdxs.length >= 2) {
+      state.canShrinkColLeft = true;
+      state.canShrinkColRight = true;
+    }
+    if (anchorState.rowIdxs.length >= 2) {
+      state.canShrinkRowUp = true;
+      state.canShrinkRowDown = true;
+    }
+  }
+
+  // Expand / Add / Move — старая логика на классификации.
   if (cls.mode === "none") {
     if (hasCell && sel.length === 1 && isVisible(sel[0])) {
       const lc = ctx!.model.cellByNodeId.get(sel[0].id);
@@ -1067,14 +1289,10 @@ function computeNavState(): NavState {
   const rowActive = (cls.mode === "row" || cls.mode === "both") && cls.rowPositions.length < cls.totalRows;
 
   if (colActive) {
-    state.canPrevCol = true;
-    state.canNextCol = true;
     state.canExpColLeft = true;
     state.canExpColRight = true;
   }
   if (rowActive) {
-    state.canPrevRow = true;
-    state.canNextRow = true;
     state.canExpRowUp = true;
     state.canExpRowDown = true;
   }
@@ -1119,7 +1337,18 @@ function pushStatusFromSelection() {
 }
 
 figma.on("selectionchange", () => {
+  // Это наше изменение selection или пользовательское?
+  const currentIds = figma.currentPage.selection.map((n) => n.id);
+  let isOurChange = false;
+  if (lastPluginSelectionIds !== null && currentIds.length === lastPluginSelectionIds.size) {
+    isOurChange = currentIds.every((id) => lastPluginSelectionIds!.has(id));
+  }
+  lastPluginSelectionIds = null;
+
   refreshCache();
+  if (!isOurChange) {
+    refreshAnchorFromSelection();
+  }
   pushNavState();
   pushStatusFromSelection();
 });
@@ -1132,6 +1361,7 @@ figma.ui.onmessage = async (msg: { type: string; includeHeader?: boolean; mode?:
     const value = stored === undefined ? true : Boolean(stored);
     figma.ui.postMessage({ type: "init-state", includeHeader: value });
     refreshCache();
+    refreshAnchorFromSelection();
     pushNavState();
     pushStatusFromSelection();
     return;
@@ -1143,10 +1373,14 @@ figma.ui.onmessage = async (msg: { type: string; includeHeader?: boolean; mode?:
     response = selectColumn(msg.includeHeader === true);
   } else if (msg.type === "select-all") {
     response = selectAll(msg.includeHeader === true);
+  } else if (msg.type === "clear-selection") {
+    response = clearSelection();
   } else if (msg.type === "nav" && msg.mode && msg.direction) {
     response = navigate(msg.mode, msg.direction, msg.includeHeader === true);
   } else if (msg.type === "expand" && msg.mode && msg.direction) {
     response = expand(msg.mode, msg.direction, msg.includeHeader === true);
+  } else if (msg.type === "shrink" && msg.mode && msg.direction) {
+    response = shrink(msg.mode, msg.direction, msg.includeHeader === true);
   } else if (msg.type === "toggle-header") {
     response = toggleHeader(msg.includeHeader === true);
   } else if (msg.type === "add" && msg.mode && msg.direction) {
