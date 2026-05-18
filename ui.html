@@ -149,6 +149,14 @@
     <button class="nav-btn" id="add-row-down" disabled title="Дублировать нижнюю строку выделения и вставить снизу">Стр↓</button>
   </div>
 
+  <div class="section-label">Перемещение</div>
+  <div class="nav-row">
+    <button class="nav-btn" id="move-col-left" disabled title="Поменять столбец местами с соседним слева">⇇Стб</button>
+    <button class="nav-btn" id="move-col-right" disabled title="Поменять столбец местами с соседним справа">Стб⇉</button>
+    <button class="nav-btn" id="move-row-up" disabled title="Поменять строку местами с соседней сверху (не с заголовком)">⇈Стр</button>
+    <button class="nav-btn" id="move-row-down" disabled title="Поменять строку местами с соседней снизу">Стр⇊</button>
+  </div>
+
   <div id="status" class="empty">Выделите ячейку таблицы</div>
 
   <script>
@@ -168,6 +176,10 @@
     const addColRight = document.getElementById('add-col-right');
     const addRowUp = document.getElementById('add-row-up');
     const addRowDown = document.getElementById('add-row-down');
+    const moveColLeft = document.getElementById('move-col-left');
+    const moveColRight = document.getElementById('move-col-right');
+    const moveRowUp = document.getElementById('move-row-up');
+    const moveRowDown = document.getElementById('move-row-down');
     const status = document.getElementById('status');
 
     function send(payload) {
@@ -196,6 +208,11 @@
     addRowUp.addEventListener('click', () => send({ type: 'add', mode: 'row', direction: 'prev' }));
     addRowDown.addEventListener('click', () => send({ type: 'add', mode: 'row', direction: 'next' }));
 
+    moveColLeft.addEventListener('click', () => send({ type: 'move', mode: 'column', direction: 'prev' }));
+    moveColRight.addEventListener('click', () => send({ type: 'move', mode: 'column', direction: 'next' }));
+    moveRowUp.addEventListener('click', () => send({ type: 'move', mode: 'row', direction: 'prev' }));
+    moveRowDown.addEventListener('click', () => send({ type: 'move', mode: 'row', direction: 'next' }));
+
     window.onmessage = (event) => {
       const msg = event.data.pluginMessage;
       if (!msg) return;
@@ -218,6 +235,10 @@
         addColRight.disabled = !msg.canAddColRight;
         addRowUp.disabled = !msg.canAddRowUp;
         addRowDown.disabled = !msg.canAddRowDown;
+        moveColLeft.disabled = !msg.canMoveColLeft;
+        moveColRight.disabled = !msg.canMoveColRight;
+        moveRowUp.disabled = !msg.canMoveRowUp;
+        moveRowDown.disabled = !msg.canMoveRowDown;
       } else if (msg.type === 'init-state') {
         // Программная установка .checked не вызывает change event — toggle-header не сработает
         cbHeader.checked = !!msg.includeHeader;

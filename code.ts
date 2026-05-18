@@ -1,4 +1,4 @@
-figma.showUI(__html__, { width: 280, height: 500 });
+figma.showUI(__html__, { width: 280, height: 580 });
 
 const X_TOLERANCE = 1;
 const MIN_ROWS_FOR_TABLE = 2;
@@ -20,6 +20,10 @@ type NavState = {
   canAddColRight: boolean;
   canAddRowUp: boolean;
   canAddRowDown: boolean;
+  canMoveColLeft: boolean;
+  canMoveColRight: boolean;
+  canMoveRowUp: boolean;
+  canMoveRowDown: boolean;
 };
 
 type Classification = {
@@ -785,6 +789,323 @@ function addRow(direction: "prev" | "next"): Response {
   return { ok: true, message: `Добавлена строка: ${newCells.length} ячеек` };
 }
 
+// ---------- actions: move ----------
+
+// Валидация: блок сплошной (по позициям), есть сосед с учётом wrap и пропуска skipPos.
+// Возвращает isWrap — был ли это wrap-случай (с перескоком через край или skipPos).
+function validateMoveBlock(
+  positions: number[],
+  visibleIdxs: number[],
+  direction: "prev" | "next",
+  skipPos: number | null,
+): { ok: false } | { ok: true; blockIdxs: number[]; neighborIdx: number; isWrap: boolean } {
+  if (positions.length === 0) return { ok: false };
+  const sorted = [...positions].sort((a, b) => a - b);
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] !== sorted[i - 1] + 1) return { ok: false };
+  }
+  const total = visibleIdxs.length;
+  if (skipPos !== null && sorted.indexOf(skipPos) >= 0) return { ok: false };
+  const usableTotal = skipPos !== null ? total - 1 : total;
+  if (sorted.length >= usableTotal) return { ok: false };
+
+  const blockStartPos = sorted[0];
+  const blockEndPos = sorted[sorted.length - 1];
+  const inBlock = (p: number) => sorted.indexOf(p) >= 0;
+
+  // Сначала пробуем сосед в естественном (не-wrap) направлении
+  let naive: number;
+  let isWrap: boolean;
+  if (direction === "next") {
+    naive = blockEndPos + 1;
+    isWrap = naive >= total || naive === skipPos;
+  } else {
+    naive = blockStartPos - 1;
+    isWrap = naive < 0 || naive === skipPos;
+  }
+
+  let neighborPos: number;
+  if (!isWrap) {
+    neighborPos = naive;
+  } else {
+    // Wrap: ищем ближайший допустимый сосед, перескакивая skipPos и блок
+    let attempts = total + 1;
+    if (direction === "next") {
+      neighborPos = (blockEndPos + 1) % total;
+      while ((neighborPos === skipPos || inBlock(neighborPos)) && attempts-- > 0) {
+        neighborPos = (neighborPos + 1) % total;
+      }
+    } else {
+      neighborPos = (blockStartPos - 1 + total) % total;
+      while ((neighborPos === skipPos || inBlock(neighborPos)) && attempts-- > 0) {
+        neighborPos = (neighborPos - 1 + total) % total;
+      }
+    }
+    if (attempts < 0) return { ok: false };
+  }
+
+  return {
+    ok: true,
+    blockIdxs: sorted.map((p) => visibleIdxs[p]),
+    neighborIdx: visibleIdxs[neighborPos],
+    isWrap,
+  };
+}
+
+// Карта вращения для non-wrap случая: участвуют только block + neighbor.
+function buildRotationMap(
+  blockIdxs: number[], neighborIdx: number, direction: "prev" | "next",
+): Map<number, number> {
+  const N = blockIdxs.length;
+  const map = new Map<number, number>();
+  if (direction === "next") {
+    for (let i = 0; i < N - 1; i++) map.set(blockIdxs[i], blockIdxs[i + 1]);
+    map.set(blockIdxs[N - 1], neighborIdx);
+    map.set(neighborIdx, blockIdxs[0]);
+  } else {
+    for (let i = 1; i < N; i++) map.set(blockIdxs[i], blockIdxs[i - 1]);
+    map.set(blockIdxs[0], neighborIdx);
+    map.set(neighborIdx, blockIdxs[N - 1]);
+  }
+  return map;
+}
+
+// Карта вращения для WRAP случая: блок ЦЕЛИКОМ телепортируется на противоположный край цикла,
+// остальные ячейки сдвигаются на N позиций в обратном направлении чтобы заполнить освободившееся место.
+// Это сохраняет contigous-ность блока (важно для multi-block move).
+function buildWrapRotationMap(
+  cycleIdxs: number[], // все idx в цикле, отсортированные по возрастанию
+  blockIdxs: number[], // contiguous блок (subset of cycleIdxs), отсортированный
+  direction: "prev" | "next",
+): Map<number, number> {
+  const map = new Map<number, number>();
+  const T = cycleIdxs.length;
+  const N = blockIdxs.length;
+  if (T === 0 || N === 0 || N >= T) return map;
+
+  if (direction === "prev") {
+    // Wrap "prev" возможен только когда блок в начале цикла (cycle positions 0..N-1).
+    // Блок едет на конец (cycle positions T-N..T-1).
+    // Не-блок (cycle positions N..T-1) сдвигается налево на N (на cycle positions 0..T-N-1).
+    for (let i = 0; i < N; i++) {
+      map.set(cycleIdxs[i], cycleIdxs[T - N + i]);
+    }
+    for (let i = 0; i < T - N; i++) {
+      map.set(cycleIdxs[N + i], cycleIdxs[i]);
+    }
+  } else {
+    // Wrap "next" возможен только когда блок в конце цикла (cycle positions T-N..T-1).
+    // Блок едет в начало (cycle positions 0..N-1).
+    // Не-блок (cycle positions 0..T-N-1) сдвигается направо на N (на cycle positions N..T-1).
+    for (let i = 0; i < N; i++) {
+      map.set(cycleIdxs[T - N + i], cycleIdxs[i]);
+    }
+    for (let i = 0; i < T - N; i++) {
+      map.set(cycleIdxs[i], cycleIdxs[N + i]);
+    }
+  }
+  return map;
+}
+
+// Перемещение child внутри того же родителя в Figma имеет "insert + remove" семантику:
+// если target > currentIdx, после удаления старой позиции узел оказывается на target-1.
+// Компенсируем этот off-by-one инкрементом target.
+function moveWithinParent(
+  parent: ChildrenMixin, target: number, child: SceneNode, currentIdx: number,
+): void {
+  if (currentIdx === target) return;
+  const adjusted = currentIdx < target ? target + 1 : target;
+  parent.insertChild(adjusted, child);
+}
+
+function moveColumnStack(model: TableModel, rotation: Map<number, number>): boolean {
+  const involved = new Set<number>([...rotation.keys()]);
+  const sortedTargets = [...involved].sort((a, b) => a - b);
+
+  for (const rowIdx of model.allRowIdxs) {
+    const rowNode = model.rowNodeByIdx.get(rowIdx);
+    if (!rowNode) continue;
+    const cellBySource = new Map<number, SceneNode>();
+    for (const lc of model.cells) {
+      if (lc.rowIdx === rowIdx && involved.has(lc.colIdx)) cellBySource.set(lc.colIdx, lc.node);
+    }
+    for (const target of sortedTargets) {
+      let source: number | undefined;
+      for (const [s, t] of rotation) if (t === target) { source = s; break; }
+      if (source === undefined) continue;
+      const cell = cellBySource.get(source);
+      if (!cell) continue;
+      let currentIdx = -1;
+      for (let i = 0; i < rowNode.children.length; i++) {
+        if (rowNode.children[i].id === cell.id) { currentIdx = i; break; }
+      }
+      moveWithinParent(rowNode, target, cell, currentIdx);
+    }
+  }
+  return true;
+}
+
+// Для grid с GridAutoTracks Figma запрещает setGridChildPosition. Доступны только
+// appendChild (auto-place в первую свободную ячейку по auto-flow row-major).
+// Алгоритм: detach все ячейки, которые должны переехать, в currentPage; затем
+// appendChild их обратно в правильном target row-major порядке. Auto-flow auto-tracks
+// расставляет их по освободившимся позициям ровно туда, куда нужно.
+function moveCellsViaAutoFlow(
+  body: FrameNode,
+  involvedCells: LogicalCell[],
+  rotation: Map<number, number>,
+  axis: "row" | "column",
+  visibleRowIdxs: number[],
+  visibleColIdxs: number[],
+): void {
+  // Lookup ячейки по (rowIdx, colIdx)
+  const cellByPos = new Map<string, SceneNode>();
+  for (const lc of involvedCells) {
+    cellByPos.set(`${lc.rowIdx},${lc.colIdx}`, lc.node);
+  }
+  // Обратная карта: target idx → source idx
+  const sourceOfTarget = new Map<number, number>();
+  for (const [src, tgt] of rotation) sourceOfTarget.set(tgt, src);
+
+  // Detach все задействованные ячейки
+  for (const lc of involvedCells) {
+    figma.currentPage.appendChild(lc.node);
+  }
+
+  // AppendChild в target row-major порядке
+  if (axis === "row") {
+    // moveRow: rotation по rowIdx. Target rows в порядке возрастания. Внутри каждого — все colIdx по порядку.
+    const targetRowsAsc = [...new Set(rotation.keys())].sort((a, b) => a - b);
+    for (const targetRow of targetRowsAsc) {
+      const sourceRow = sourceOfTarget.get(targetRow);
+      if (sourceRow === undefined) continue;
+      for (const colIdx of visibleColIdxs) {
+        const cell = cellByPos.get(`${sourceRow},${colIdx}`);
+        if (cell) body.appendChild(cell);
+      }
+    }
+  } else {
+    // moveColumn: rotation по colIdx. Идём построчно (row-major) по ВСЕМ строкам,
+    // в каждой строке выкладываем involved target cols по порядку.
+    const targetColsAsc = [...new Set(rotation.keys())].sort((a, b) => a - b);
+    for (const rowIdx of visibleRowIdxs) {
+      for (const targetCol of targetColsAsc) {
+        const sourceCol = sourceOfTarget.get(targetCol);
+        if (sourceCol === undefined) continue;
+        const cell = cellByPos.get(`${rowIdx},${sourceCol}`);
+        if (cell) body.appendChild(cell);
+      }
+    }
+  }
+}
+
+function moveColumnGrid(model: TableModel, rotation: Map<number, number>): boolean {
+  const body = model.body as FrameNode;
+  const involvedSet = new Set([...rotation.keys()]);
+  const involvedCells = model.cells.filter((lc) => involvedSet.has(lc.colIdx));
+  if (involvedCells.length === 0) return false;
+
+  try {
+    moveCellsViaAutoFlow(body, involvedCells, rotation, "column", model.visibleRowIdxs, model.visibleColIdxs);
+    return true;
+  } catch (e) {
+    figma.notify(`Ошибка move column: ${String(e).slice(0, 100)}`, { error: true });
+    return false;
+  }
+}
+
+function moveColumn(direction: "prev" | "next"): Response {
+  const ctx = getContext();
+  if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
+  const cls = classifySelection();
+  if (cls.mode !== "column") return { ok: false, message: "Выделите столбец" };
+  const validate = validateMoveBlock(cls.colPositions, ctx.model.visibleColIdxs, direction, null);
+  if (!validate.ok) return { ok: false, message: "Нельзя двигать" };
+
+  const rotation = validate.isWrap
+    ? buildWrapRotationMap(ctx.model.visibleColIdxs, validate.blockIdxs, direction)
+    : buildRotationMap(validate.blockIdxs, validate.neighborIdx, direction);
+
+  const ok = ctx.model.type === "grid"
+    ? moveColumnGrid(ctx.model, rotation)
+    : moveColumnStack(ctx.model, rotation);
+
+  if (!ok) return { ok: false, message: "Не удалось переместить" };
+  refreshCache();
+  return { ok: true, message: `Столбец перемещён ${direction === "next" ? "вправо" : "влево"}` };
+}
+
+function moveRowStack(model: TableModel, rotation: Map<number, number>): boolean {
+  const involved = new Set<number>([...rotation.keys()]);
+  const sortedTargets = [...involved].sort((a, b) => a - b);
+  const body = model.body;
+
+  const rowBySource = new Map<number, SceneNode & ChildrenMixin>();
+  for (const idx of involved) {
+    const rn = model.rowNodeByIdx.get(idx);
+    if (rn) rowBySource.set(idx, rn);
+  }
+
+  for (const target of sortedTargets) {
+    let source: number | undefined;
+    for (const [s, t] of rotation) if (t === target) { source = s; break; }
+    if (source === undefined) continue;
+    const row = rowBySource.get(source);
+    if (!row) continue;
+    let currentIdx = -1;
+    for (let i = 0; i < body.children.length; i++) {
+      if (body.children[i].id === row.id) { currentIdx = i; break; }
+    }
+    moveWithinParent(body, target, row, currentIdx);
+  }
+  return true;
+}
+
+function moveRowGrid(model: TableModel, rotation: Map<number, number>): boolean {
+  const body = model.body as FrameNode;
+  const involvedSet = new Set([...rotation.keys()]);
+  const involvedCells = model.cells.filter((lc) => involvedSet.has(lc.rowIdx));
+  if (involvedCells.length === 0) return false;
+
+  try {
+    moveCellsViaAutoFlow(body, involvedCells, rotation, "row", model.visibleRowIdxs, model.visibleColIdxs);
+    return true;
+  } catch (e) {
+    figma.notify(`Ошибка move row: ${String(e).slice(0, 100)}`, { error: true });
+    return false;
+  }
+}
+
+function moveRow(direction: "prev" | "next"): Response {
+  const ctx = getContext();
+  if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
+  const cls = classifySelection();
+  if (cls.mode !== "row") return { ok: false, message: "Выделите строку" };
+
+  const headerPos = ctx.model.visibleRowIdxs.indexOf(ctx.model.headerRowIdx);
+  const skipPos = headerPos >= 0 ? headerPos : null;
+
+  const validate = validateMoveBlock(cls.rowPositions, ctx.model.visibleRowIdxs, direction, skipPos);
+  if (!validate.ok) return { ok: false, message: "Нельзя двигать" };
+
+  let rotation: Map<number, number>;
+  if (validate.isWrap) {
+    // При wrap — блок целиком телепортируется на противоположный край цикла (видимые ряды без Header).
+    const cycleIdxs = ctx.model.visibleRowIdxs.filter((idx) => idx !== ctx.model.headerRowIdx);
+    rotation = buildWrapRotationMap(cycleIdxs, validate.blockIdxs, direction);
+  } else {
+    rotation = buildRotationMap(validate.blockIdxs, validate.neighborIdx, direction);
+  }
+
+  const ok = ctx.model.type === "grid"
+    ? moveRowGrid(ctx.model, rotation)
+    : moveRowStack(ctx.model, rotation);
+
+  if (!ok) return { ok: false, message: "Не удалось переместить" };
+  refreshCache();
+  return { ok: true, message: `Строка перемещена ${direction === "next" ? "вниз" : "вверх"}` };
+}
+
 // ---------- state push ----------
 
 function computeNavState(): NavState {
@@ -797,6 +1118,8 @@ function computeNavState(): NavState {
     canSelectAll: false,
     canAddColLeft: false, canAddColRight: false,
     canAddRowUp: false, canAddRowDown: false,
+    canMoveColLeft: false, canMoveColRight: false,
+    canMoveRowUp: false, canMoveRowDown: false,
   };
 
   const sel = figma.currentPage.selection;
@@ -856,10 +1179,22 @@ function computeNavState(): NavState {
   if (cls.mode === "column") {
     state.canAddColLeft = true;
     state.canAddColRight = true;
+    const leftVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "prev", null);
+    const rightVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "next", null);
+    state.canMoveColLeft = leftVal.ok;
+    state.canMoveColRight = rightVal.ok;
   } else if (cls.mode === "row") {
     const edges = findEdgeRowIdxs();
     state.canAddRowUp = edges.top !== null && !isHeaderRowIdx(edges.top);
     state.canAddRowDown = edges.bottom !== null && !isHeaderRowIdx(edges.bottom);
+    if (ctx) {
+      const headerPos = ctx.model.visibleRowIdxs.indexOf(ctx.model.headerRowIdx);
+      const skipPos = headerPos >= 0 ? headerPos : null;
+      const upVal = validateMoveBlock(cls.rowPositions, ctx.model.visibleRowIdxs, "prev", skipPos);
+      const downVal = validateMoveBlock(cls.rowPositions, ctx.model.visibleRowIdxs, "next", skipPos);
+      state.canMoveRowUp = upVal.ok;
+      state.canMoveRowDown = downVal.ok;
+    }
   }
 
   return state;
@@ -911,6 +1246,8 @@ figma.ui.onmessage = async (msg: { type: string; includeHeader?: boolean; mode?:
     response = toggleHeader(msg.includeHeader === true);
   } else if (msg.type === "add" && msg.mode && msg.direction) {
     response = msg.mode === "column" ? addColumn(msg.direction) : addRow(msg.direction);
+  } else if (msg.type === "move" && msg.mode && msg.direction) {
+    response = msg.mode === "column" ? moveColumn(msg.direction) : moveRow(msg.direction);
   }
 
   if (response) {
