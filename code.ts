@@ -275,24 +275,30 @@ function analyzeBody(body: BaseNode): TableModel | null {
 
 // Если node — это контейнер строки stack-таблицы, возвращает её ячейки.
 // Иначе null. Работает только для stack-таблиц (у grid нет row-контейнеров).
+// Перебираем все children (не только первого) — на случай если первый ребёнок
+// строки это не cell, а фоновая плашка/иконка.
 function getRowCellsIfRowContainer(node: SceneNode): SceneNode[] | null {
   if (!("children" in node)) return null;
   const childMixin = node as SceneNode & ChildrenMixin;
   if (childMixin.children.length === 0) return null;
-  // Берём первый дочерний (предполагаемая ячейка) и проверяем через findTableContext.
-  const firstChild = childMixin.children[0] as SceneNode;
-  const ctx = findTableContext(firstChild);
-  if (!ctx || ctx.model.type !== "stack") return null;
-  const lc = ctx.model.cellByNodeId.get(ctx.cell.id);
-  if (!lc) return null;
-  const rowNode = ctx.model.rowNodeByIdx.get(lc.rowIdx);
-  if (!rowNode || rowNode.id !== node.id) return null;
-  return cellsAtRow(ctx.model, lc.rowIdx, true);
+
+  for (const child of childMixin.children) {
+    const ctx = findTableContext(child as SceneNode);
+    if (!ctx || ctx.model.type !== "stack") continue;
+    const lc = ctx.model.cellByNodeId.get(ctx.cell.id);
+    if (!lc) continue;
+    const rowNode = ctx.model.rowNodeByIdx.get(lc.rowIdx);
+    if (!rowNode || rowNode.id !== node.id) continue;
+    return cellsAtRow(ctx.model, lc.rowIdx, true);
+  }
+  return null;
 }
 
-// Заменяет в выделении любые row-контейнеры на их ячейки.
-// Возвращает новый массив, либо null если ничего не изменилось.
-function expandSelectionWithRowContainers(sel: readonly SceneNode[]): SceneNode[] | null {
+// "Эффективное выделение": возвращает ячейки, на которые ссылается текущее
+// Figma-выделение. Row-контейнеры виртуально разворачиваются в свои ячейки.
+// САМО выделение в Figma не меняется — это только внутренняя интерпретация.
+function effectiveSelection(): SceneNode[] {
+  const sel = figma.currentPage.selection;
   let changed = false;
   const seen = new Set<string>();
   const result: SceneNode[] = [];
@@ -309,7 +315,7 @@ function expandSelectionWithRowContainers(sel: readonly SceneNode[]): SceneNode[
       result.push(n);
     }
   }
-  return changed ? result : null;
+  return changed ? result : sel.slice();
 }
 
 // ---------- find table context ----------
@@ -352,9 +358,13 @@ let anchorState: AnchorState | null = null;
 // Если плагин сам менял selection — запоминаем какие id выставили,
 // чтобы при последующем selectionchange не сбрасывать anchorState.
 let lastPluginSelectionIds: Set<string> | null = null;
+// Если пользователь выделил row-контейнер, первое нажатие на action-кнопку
+// (nav/expand/shrink/add/move) не выполняет действие, а переводит выделение
+// Figma на ячейки этой строки. Следующее нажатие — уже сама операция.
+let pendingContainerCells: SceneNode[] | null = null;
 
 function refreshCache(): void {
-  const sel = figma.currentPage.selection;
+  const sel = effectiveSelection();
   cacheCtx = sel.length > 0 ? findTableContext(sel[0]) : null;
 }
 
@@ -375,7 +385,7 @@ function refreshAnchorFromSelection(): void {
     return;
   }
   const model = cacheCtx.model;
-  const sel = figma.currentPage.selection;
+  const sel = effectiveSelection();
 
   const lcs: LogicalCell[] = [];
   for (const n of sel) {
@@ -446,7 +456,7 @@ function classifySelection(): Classification {
   const empty: Classification = {
     mode: "none", rowPositions: [], colPositions: [], totalRows: 0, totalCols: 0,
   };
-  const sel = figma.currentPage.selection;
+  const sel = effectiveSelection();
   if (sel.length === 0 || !cacheCtx) return empty;
   const model = cacheCtx.model;
 
@@ -692,12 +702,14 @@ function shrink(mode: "column" | "row", direction: "prev" | "next", includeHeade
   const model = ctx.model;
 
   if (mode === "column") {
+    if (anchorState.axis === "row") return { ok: false, message: "Нельзя сузить столбцы у строки" };
     if (anchorState.colIdxs.length < 2) return { ok: false, message: "Не из чего сужать" };
     const sorted = [...anchorState.colIdxs].sort((a, b) => a - b);
     if (direction === "prev") sorted.shift();
     else sorted.pop();
     anchorState.colIdxs = sorted;
   } else {
+    if (anchorState.axis === "column") return { ok: false, message: "Нельзя сузить строки у столбца" };
     if (anchorState.rowIdxs.length < 2) return { ok: false, message: "Не из чего сужать" };
     const sorted = [...anchorState.rowIdxs].sort((a, b) => a - b);
     if (direction === "prev") sorted.shift();
@@ -1263,12 +1275,13 @@ function computeNavState(): NavState {
     canMoveRowUp: false, canMoveRowDown: false,
   };
 
-  const sel = figma.currentPage.selection;
+  const figmaSel = figma.currentPage.selection;
+  const sel = effectiveSelection();
   const ctx = getContext();
   const hasCell = ctx !== null;
 
   if (hasCell) state.canSelectAll = true;
-  if (sel.length > 0) state.canClearSelection = true;
+  if (figmaSel.length > 0) state.canClearSelection = true;
 
   // Move-кнопки только для stack-таблиц.
   const isGrid = ctx !== null && ctx.model.type === "grid";
@@ -1297,13 +1310,17 @@ function computeNavState(): NavState {
     state.canNextRow = true;
   }
 
-  // Shrink: активны если в anchor минимум 2 ряда/столбца.
+  // Shrink: активны если в anchor минимум 2 ряда/столбца И ось селекции допускает.
+  // Для axis="row" (выделена полная строка) shrink-col не имеет смысла — у строки
+  // нет «горизонтального края» который можно было бы обрезать без потери понятия
+  // «выделена строка». Симметрично для axis="column".
   if (anchorState) {
-    if (anchorState.colIdxs.length >= 2) {
+    const axis = anchorState.axis;
+    if (anchorState.colIdxs.length >= 2 && axis !== "row") {
       state.canShrinkColLeft = true;
       state.canShrinkColRight = true;
     }
-    if (anchorState.rowIdxs.length >= 2) {
+    if (anchorState.rowIdxs.length >= 2 && axis !== "column") {
       state.canShrinkRowUp = true;
       state.canShrinkRowDown = true;
     }
@@ -1386,24 +1403,22 @@ figma.on("selectionchange", () => {
   }
   lastPluginSelectionIds = null;
 
-  // Если пользователь выделил row-контейнер — авторасширяем до его ячеек.
-  // Без этого findTableContext ничего не находит (row не cell), а buildStackModel
-  // может выдать false-positive на родителе тела и операции уведут выделение «снаружи».
-  if (!isOurChange) {
-    const expanded = expandSelectionWithRowContainers(figma.currentPage.selection);
-    if (expanded) {
-      setPluginSelection(expanded);
-      refreshCache();
-      refreshAnchorFromSelection();
-      pushNavState();
-      pushStatusFromSelection();
-      return;
-    }
-  }
-
   refreshCache();
   if (!isOurChange) {
     refreshAnchorFromSelection();
+    // Если effective-selection отличается от настоящего figma-выделения,
+    // значит пользователь выделил row-контейнер (или несколько). Запоминаем
+    // ячейки на которые надо переключиться при первом нажатии на action-кнопку.
+    const eff = effectiveSelection();
+    const effIds = new Set(eff.map((n) => n.id));
+    const figmaIds = new Set(currentIds);
+    let differs = effIds.size !== figmaIds.size;
+    if (!differs) {
+      for (const id of figmaIds) {
+        if (!effIds.has(id)) { differs = true; break; }
+      }
+    }
+    pendingContainerCells = differs ? eff : null;
   }
   pushNavState();
   pushStatusFromSelection();
@@ -1420,6 +1435,22 @@ figma.ui.onmessage = async (msg: { type: string; includeHeader?: boolean; mode?:
     refreshAnchorFromSelection();
     pushNavState();
     pushStatusFromSelection();
+    return;
+  }
+
+  // Двухшаговая логика для row-контейнеров: если выделение содержит контейнер,
+  // первое нажатие на action-кнопку только фиксирует ячейки в Figma. Сам
+  // запрос не выполняется, его надо нажать ещё раз.
+  const isTwoStepAction = msg.type === "nav" || msg.type === "expand"
+    || msg.type === "shrink" || msg.type === "add" || msg.type === "move";
+  if (isTwoStepAction && pendingContainerCells !== null) {
+    const cells = pendingContainerCells;
+    pendingContainerCells = null;
+    setPluginSelection(cells);
+    refreshCache();
+    refreshAnchorFromSelection();
+    pushNavState();
+    figma.ui.postMessage({ type: "status", ok: true, message: `Выделены ячейки: ${cells.length}` });
     return;
   }
 
