@@ -271,6 +271,47 @@ function analyzeBody(body: BaseNode): TableModel | null {
   return buildStackModel(b);
 }
 
+// ---------- row container detection ----------
+
+// Если node — это контейнер строки stack-таблицы, возвращает её ячейки.
+// Иначе null. Работает только для stack-таблиц (у grid нет row-контейнеров).
+function getRowCellsIfRowContainer(node: SceneNode): SceneNode[] | null {
+  if (!("children" in node)) return null;
+  const childMixin = node as SceneNode & ChildrenMixin;
+  if (childMixin.children.length === 0) return null;
+  // Берём первый дочерний (предполагаемая ячейка) и проверяем через findTableContext.
+  const firstChild = childMixin.children[0] as SceneNode;
+  const ctx = findTableContext(firstChild);
+  if (!ctx || ctx.model.type !== "stack") return null;
+  const lc = ctx.model.cellByNodeId.get(ctx.cell.id);
+  if (!lc) return null;
+  const rowNode = ctx.model.rowNodeByIdx.get(lc.rowIdx);
+  if (!rowNode || rowNode.id !== node.id) return null;
+  return cellsAtRow(ctx.model, lc.rowIdx, true);
+}
+
+// Заменяет в выделении любые row-контейнеры на их ячейки.
+// Возвращает новый массив, либо null если ничего не изменилось.
+function expandSelectionWithRowContainers(sel: readonly SceneNode[]): SceneNode[] | null {
+  let changed = false;
+  const seen = new Set<string>();
+  const result: SceneNode[] = [];
+  for (const n of sel) {
+    if (seen.has(n.id)) continue;
+    const rowCells = getRowCellsIfRowContainer(n);
+    if (rowCells && rowCells.length > 0) {
+      changed = true;
+      for (const c of rowCells) {
+        if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
+      }
+    } else {
+      seen.add(n.id);
+      result.push(n);
+    }
+  }
+  return changed ? result : null;
+}
+
 // ---------- find table context ----------
 
 function findTableContext(seed: SceneNode): TableContext | null {
@@ -1344,6 +1385,21 @@ figma.on("selectionchange", () => {
     isOurChange = currentIds.every((id) => lastPluginSelectionIds!.has(id));
   }
   lastPluginSelectionIds = null;
+
+  // Если пользователь выделил row-контейнер — авторасширяем до его ячеек.
+  // Без этого findTableContext ничего не находит (row не cell), а buildStackModel
+  // может выдать false-positive на родителе тела и операции уведут выделение «снаружи».
+  if (!isOurChange) {
+    const expanded = expandSelectionWithRowContainers(figma.currentPage.selection);
+    if (expanded) {
+      setPluginSelection(expanded);
+      refreshCache();
+      refreshAnchorFromSelection();
+      pushNavState();
+      pushStatusFromSelection();
+      return;
+    }
+  }
 
   refreshCache();
   if (!isOurChange) {
