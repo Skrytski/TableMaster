@@ -91,7 +91,7 @@ function isGridBody(node: BaseNode): boolean {
 
 // ---------- model: GRID ----------
 
-function buildGridModel(body: BaseNode & ChildrenMixin): TableModel | null {
+function computeGridModel(body: BaseNode & ChildrenMixin): TableModel | null {
   const cells: LogicalCell[] = [];
   const cellByNodeId = new Map<string, LogicalCell>();
 
@@ -142,7 +142,7 @@ function buildGridModel(body: BaseNode & ChildrenMixin): TableModel | null {
 
 // ---------- model: STACK ----------
 
-function buildStackModel(body: BaseNode & ChildrenMixin): TableModel | null {
+function computeStackModel(body: BaseNode & ChildrenMixin): TableModel | null {
   type RowCandidate = {
     rowNode: SceneNode & ChildrenMixin;
     rowVisible: boolean;
@@ -262,13 +262,33 @@ function buildStackModel(body: BaseNode & ChildrenMixin): TableModel | null {
   };
 }
 
-// ---------- analyze body ----------
+// ---------- model cache ----------
 
-function analyzeBody(body: BaseNode): TableModel | null {
-  if (!("children" in body)) return null;
-  const b = body as BaseNode & ChildrenMixin;
-  if (isGridBody(b)) return buildGridModel(b);
-  return buildStackModel(b);
+// Кешируем дорогую сборку модели по body.id. Один селекшен-цикл может
+// тригерить десяток вызовов findTableContext/buildStackModel; без кеша
+// каждый клик пересчитывает выравнивания N раз. Кеш сбрасывается при
+// selectionchange и после структурных мутаций (add/move).
+const modelCache = new Map<string, TableModel | null>();
+
+function buildGridModel(body: BaseNode & ChildrenMixin): TableModel | null {
+  const key = "g:" + body.id;
+  if (modelCache.has(key)) return modelCache.get(key)!;
+  const m = computeGridModel(body);
+  modelCache.set(key, m);
+  return m;
+}
+
+function buildStackModel(body: BaseNode & ChildrenMixin): TableModel | null {
+  const key = "s:" + body.id;
+  if (modelCache.has(key)) return modelCache.get(key)!;
+  const m = computeStackModel(body);
+  modelCache.set(key, m);
+  return m;
+}
+
+function invalidateModelCache(): void {
+  modelCache.clear();
+  effectiveSelCache = null;
 }
 
 // ---------- row container detection ----------
@@ -284,7 +304,12 @@ function getRowCellsIfRowContainer(node: SceneNode): SceneNode[] | null {
 
   for (const child of childMixin.children) {
     const ctx = findTableContext(child as SceneNode);
-    if (!ctx || ctx.model.type !== "stack") continue;
+    if (!ctx) continue;
+    // Grid не имеет row-контейнеров — выходим сразу, не пытаемся другие дети.
+    if (ctx.model.type !== "stack") return null;
+    // Если ребёнок резолвится в нашу же ноду как cell — значит наша нода
+    // сама и есть ячейка таблицы, а не row-контейнер.
+    if (ctx.cell.id === node.id) return null;
     const lc = ctx.model.cellByNodeId.get(ctx.cell.id);
     if (!lc) continue;
     const rowNode = ctx.model.rowNodeByIdx.get(lc.rowIdx);
@@ -297,8 +322,17 @@ function getRowCellsIfRowContainer(node: SceneNode): SceneNode[] | null {
 // "Эффективное выделение": возвращает ячейки, на которые ссылается текущее
 // Figma-выделение. Row-контейнеры виртуально разворачиваются в свои ячейки.
 // САМО выделение в Figma не меняется — это только внутренняя интерпретация.
+// Мемоизировано по signature текущего selection: вызов ~5-6 раз за цикл
+// (refreshCache, refreshAnchor, classify, computeNavState и т.д.), без
+// кеша каждый раз пересчитывался бы один и тот же ответ.
+let effectiveSelCache: { sig: string; result: SceneNode[] } | null = null;
+
 function effectiveSelection(): SceneNode[] {
   const sel = figma.currentPage.selection;
+  const sig = sel.length + ":" + sel.map((n) => n.id).join("|");
+  if (effectiveSelCache !== null && effectiveSelCache.sig === sig) {
+    return effectiveSelCache.result;
+  }
   let changed = false;
   const seen = new Set<string>();
   const result: SceneNode[] = [];
@@ -315,7 +349,9 @@ function effectiveSelection(): SceneNode[] {
       result.push(n);
     }
   }
-  return changed ? result : sel.slice();
+  const final = changed ? result : sel.slice();
+  effectiveSelCache = { sig, result: final };
+  return final;
 }
 
 // ---------- find table context ----------
@@ -936,10 +972,10 @@ function addColumn(direction: "prev" | "next"): Response {
     : addColumnStack(ctx.model, anchorColIdx, direction);
 
   if (newCells.length === 0) return { ok: false, message: "Не удалось продублировать" };
+  invalidateModelCache(); // структура поменялась — кеш моделей устарел
   setPluginSelection(newCells);
-  // Anchor пересчитается из selectionchange, lastPluginSelectionIds выставлен —
-  // но новые узлы изменили структуру; принудительно сбросим, чтобы refreshAnchor отработал.
-  lastPluginSelectionIds = null;
+  refreshCache();
+  refreshAnchorFromSelection();
   return { ok: true, message: `Добавлен столбец: ${newCells.length} ячеек` };
 }
 
@@ -1015,8 +1051,10 @@ function addRow(direction: "prev" | "next"): Response {
     : addRowStack(ctx.model, anchorRowIdx, direction);
 
   if (newCells.length === 0) return { ok: false, message: "Не удалось продублировать" };
+  invalidateModelCache();
   setPluginSelection(newCells);
-  lastPluginSelectionIds = null;
+  refreshCache();
+  refreshAnchorFromSelection();
   return { ok: true, message: `Добавлена строка: ${newCells.length} ячеек` };
 }
 
@@ -1194,6 +1232,7 @@ function moveColumn(direction: "prev" | "next"): Response {
   const ok = moveColumnStack(ctx.model, rotation);
 
   if (!ok) return { ok: false, message: "Не удалось переместить" };
+  invalidateModelCache();
   refreshCache();
   refreshAnchorFromSelection();
   return { ok: true, message: `Столбец перемещён ${direction === "next" ? "вправо" : "влево"}` };
@@ -1252,7 +1291,9 @@ function moveRow(direction: "prev" | "next"): Response {
   const ok = moveRowStack(ctx.model, rotation);
 
   if (!ok) return { ok: false, message: "Не удалось переместить" };
+  invalidateModelCache();
   refreshCache();
+  refreshAnchorFromSelection();
   return { ok: true, message: `Строка перемещена ${direction === "next" ? "вниз" : "вверх"}` };
 }
 
@@ -1395,6 +1436,11 @@ function pushStatusFromSelection() {
 }
 
 figma.on("selectionchange", () => {
+  // На каждый selectionchange — сбрасываем модель-кеш. Внутри одного
+  // хендлера effectiveSelection/findTableContext дёргаются 5-6 раз;
+  // без кеша каждый из них пересчитывает buildStackModel заново.
+  invalidateModelCache();
+
   // Это наше изменение selection или пользовательское?
   const currentIds = figma.currentPage.selection.map((n) => n.id);
   let isOurChange = false;
