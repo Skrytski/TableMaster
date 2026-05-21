@@ -1,6 +1,5 @@
 figma.showUI(__html__, { width: 280, height: 700 });
 
-const X_TOLERANCE = 1;
 const MIN_ROWS_FOR_TABLE = 2;
 const MIN_ALIGNED_COLS_FOR_TABLE = 2;
 const STORAGE_KEY_INCLUDE_HEADER = "includeHeader";
@@ -68,6 +67,10 @@ type TableModel = {
   allColIdxs: number[];        // sorted asc
   rowNodeByIdx: Map<number, SceneNode & ChildrenMixin>; // stack only
   headerRowIdx: number; // = visibleRowIdxs[0] если есть
+  // Преднасчитанные индексы видимых ячеек — чтобы classifySelection и другие
+  // operations не сканировали model.cells заново на каждом обращении.
+  visibleColsByRow: Map<number, Set<number>>;
+  visibleRowsByCol: Map<number, Set<number>>;
 };
 
 type TableContext = {
@@ -126,6 +129,8 @@ function computeGridModel(body: BaseNode & ChildrenMixin): TableModel | null {
 
   if (allRowIdxs.length < MIN_ROWS_FOR_TABLE || allColIdxs.length < MIN_ALIGNED_COLS_FOR_TABLE) return null;
 
+  const { visibleColsByRow, visibleRowsByCol } = buildVisibilityMaps(cells);
+
   return {
     type: "grid",
     body,
@@ -137,6 +142,8 @@ function computeGridModel(body: BaseNode & ChildrenMixin): TableModel | null {
     allColIdxs,
     rowNodeByIdx: new Map(),
     headerRowIdx: visibleRowIdxs.length > 0 ? visibleRowIdxs[0] : 0,
+    visibleColsByRow,
+    visibleRowsByCol,
   };
 }
 
@@ -248,6 +255,8 @@ function computeStackModel(body: BaseNode & ChildrenMixin): TableModel | null {
   for (const lc of cells) if (lc.visible) visColSet.add(lc.colIdx);
   const visibleColIdxs = [...visColSet].sort((a, b) => a - b);
 
+  const { visibleColsByRow, visibleRowsByCol } = buildVisibilityMaps(cells);
+
   return {
     type: "stack",
     body,
@@ -259,7 +268,28 @@ function computeStackModel(body: BaseNode & ChildrenMixin): TableModel | null {
     allColIdxs,
     rowNodeByIdx,
     headerRowIdx: visibleRowIdxs.length > 0 ? visibleRowIdxs[0] : 0,
+    visibleColsByRow,
+    visibleRowsByCol,
   };
+}
+
+// Один проход по cells — две карты для всех последующих запросов по rows/cols.
+function buildVisibilityMaps(cells: LogicalCell[]): {
+  visibleColsByRow: Map<number, Set<number>>;
+  visibleRowsByCol: Map<number, Set<number>>;
+} {
+  const visibleColsByRow = new Map<number, Set<number>>();
+  const visibleRowsByCol = new Map<number, Set<number>>();
+  for (const lc of cells) {
+    if (!lc.visible) continue;
+    let colsInRow = visibleColsByRow.get(lc.rowIdx);
+    if (!colsInRow) { colsInRow = new Set(); visibleColsByRow.set(lc.rowIdx, colsInRow); }
+    colsInRow.add(lc.colIdx);
+    let rowsInCol = visibleRowsByCol.get(lc.colIdx);
+    if (!rowsInCol) { rowsInCol = new Set(); visibleRowsByCol.set(lc.colIdx, rowsInCol); }
+    rowsInCol.add(lc.rowIdx);
+  }
+  return { visibleColsByRow, visibleRowsByCol };
 }
 
 // ---------- model cache ----------
@@ -295,7 +325,7 @@ function invalidateModelCache(): void {
 
 // Если node — это контейнер строки stack-таблицы, возвращает её ячейки.
 // Иначе null. Работает только для stack-таблиц (у grid нет row-контейнеров).
-// Перебираем все children (не только первого) — на случай если первый ребёнок
+// Перебираем все children (не только первый) — на случай, если первый ребёнок
 // строки это не cell, а фоновая плашка/иконка.
 function getRowCellsIfRowContainer(node: SceneNode): SceneNode[] | null {
   if (!("children" in node)) return null;
@@ -404,10 +434,6 @@ function refreshCache(): void {
   cacheCtx = sel.length > 0 ? findTableContext(sel[0]) : null;
 }
 
-function getContext(): TableContext | null {
-  return cacheCtx;
-}
-
 function setPluginSelection(nodes: readonly SceneNode[]): void {
   lastPluginSelectionIds = new Set(nodes.map((n) => n.id));
   figma.currentPage.selection = [...nodes];
@@ -496,98 +522,100 @@ function classifySelection(): Classification {
   if (sel.length === 0 || !cacheCtx) return empty;
   const model = cacheCtx.model;
 
-  const selectedCells: LogicalCell[] = [];
+  // Группируем выбранные ячейки по rowIdx и colIdx за один проход.
+  const selColsByRow = new Map<number, Set<number>>();
+  const selRowsByCol = new Map<number, Set<number>>();
+  let cellCount = 0;
   for (const n of sel) {
     if (!isVisible(n)) continue;
     const lc = model.cellByNodeId.get(n.id);
     if (!lc || !lc.visible) return empty;
-    selectedCells.push(lc);
+    let cols = selColsByRow.get(lc.rowIdx);
+    if (!cols) { cols = new Set(); selColsByRow.set(lc.rowIdx, cols); }
+    cols.add(lc.colIdx);
+    let rows = selRowsByCol.get(lc.colIdx);
+    if (!rows) { rows = new Set(); selRowsByCol.set(lc.colIdx, rows); }
+    rows.add(lc.rowIdx);
+    cellCount++;
   }
-  if (selectedCells.length === 0) return empty;
+  if (cellCount === 0) return empty;
 
-  // Карты позиций
-  const rowPosOf = new Map<number, number>();
-  model.visibleRowIdxs.forEach((idx, i) => rowPosOf.set(idx, i));
-  const colPosOf = new Map<number, number>();
-  model.visibleColIdxs.forEach((idx, i) => colPosOf.set(idx, i));
+  const touchedRowIdxs = [...selColsByRow.keys()];
+  const touchedColIdxs = [...selRowsByCol.keys()];
 
-  const touchedRowPos = new Set<number>();
-  const touchedColPos = new Set<number>();
-  const touchedRowIdxs = new Set<number>();
-  const touchedColIdxs = new Set<number>();
-
-  for (const lc of selectedCells) {
-    const rp = rowPosOf.get(lc.rowIdx);
-    const cp = colPosOf.get(lc.colIdx);
-    if (rp === undefined || cp === undefined) return empty;
-    touchedRowPos.add(rp);
-    touchedColPos.add(cp);
-    touchedRowIdxs.add(lc.rowIdx);
-    touchedColIdxs.add(lc.colIdx);
-  }
-
-  // fullRow: каждый затронутый ряд полностью покрыт видимыми ячейками выделения
+  // fullRow: каждая затронутая строка полностью покрыта выделением.
   let fullRow = true;
   for (const rIdx of touchedRowIdxs) {
-    const visibleColsInRow = new Set<number>();
-    for (const lc of model.cells) {
-      if (lc.rowIdx === rIdx && lc.visible) visibleColsInRow.add(lc.colIdx);
-    }
-    const selColsInRow = new Set<number>();
-    for (const lc of selectedCells) {
-      if (lc.rowIdx === rIdx) selColsInRow.add(lc.colIdx);
-    }
-    if (visibleColsInRow.size !== selColsInRow.size) { fullRow = false; break; }
+    const visCols = model.visibleColsByRow.get(rIdx);
+    const selCols = selColsByRow.get(rIdx);
+    if (!visCols || !selCols || visCols.size !== selCols.size) { fullRow = false; break; }
   }
 
-  // fullCol: каждый затронутый столбец покрывает одни и те же затронутые ряды
+  // fullCol: каждый затронутый столбец покрывает все одни и те же затронутые строки.
   let fullCol = true;
+  const touchedRowCount = touchedRowIdxs.length;
   for (const cIdx of touchedColIdxs) {
-    const rowsInCol = new Set<number>();
-    for (const lc of selectedCells) {
-      if (lc.colIdx === cIdx) rowsInCol.add(lc.rowIdx);
-    }
-    if (rowsInCol.size !== touchedRowIdxs.size) { fullCol = false; break; }
+    const rowsInCol = selRowsByCol.get(cIdx);
+    if (!rowsInCol || rowsInCol.size !== touchedRowCount) { fullCol = false; break; }
     for (const r of touchedRowIdxs) {
       if (!rowsInCol.has(r)) { fullCol = false; break; }
     }
     if (!fullCol) break;
   }
 
-  const rowPositions = [...touchedRowPos].sort((a, b) => a - b);
-  const colPositions = [...touchedColPos].sort((a, b) => a - b);
+  // Позиции (индексы) → позиции в видимом списке.
+  const rowPosOf = new Map<number, number>();
+  model.visibleRowIdxs.forEach((idx, i) => rowPosOf.set(idx, i));
+  const colPosOf = new Map<number, number>();
+  model.visibleColIdxs.forEach((idx, i) => colPosOf.set(idx, i));
+  const rowPositions: number[] = [];
+  for (const r of touchedRowIdxs) {
+    const p = rowPosOf.get(r);
+    if (p === undefined) return empty;
+    rowPositions.push(p);
+  }
+  rowPositions.sort((a, b) => a - b);
+  const colPositions: number[] = [];
+  for (const c of touchedColIdxs) {
+    const p = colPosOf.get(c);
+    if (p === undefined) return empty;
+    colPositions.push(p);
+  }
+  colPositions.sort((a, b) => a - b);
+
   const totalRows = model.visibleRowIdxs.length;
   const totalCols = model.visibleColIdxs.length;
-
-  let mode: Classification["mode"] = "none";
-  const isRow = fullRow && touchedRowIdxs.size >= 1;
-  const isCol = fullCol && touchedRowIdxs.size >= 2 && touchedColIdxs.size >= 1;
-
-  if (isRow && isCol) {
-    if (rowPositions.length === totalRows && colPositions.length === totalCols) {
-      mode = "all";
-    } else if (totalRows === 0 || totalCols === 0) {
-      mode = "both";
-    } else {
-      const rowSat = rowPositions.length / totalRows;
-      const colSat = colPositions.length / totalCols;
-      if (colSat > rowSat) mode = "row";
-      else if (rowSat > colSat) mode = "column";
-      else mode = "both";
-    }
-  } else if (isRow) {
-    mode = "row";
-  } else if (isCol) {
-    mode = "column";
-  }
+  const mode = pickMode(fullRow, fullCol, touchedRowIdxs.length, touchedColIdxs.length, rowPositions.length, colPositions.length, totalRows, totalCols);
 
   return { mode, rowPositions, colPositions, totalRows, totalCols };
+}
+
+function pickMode(
+  fullRow: boolean, fullCol: boolean,
+  touchedRows: number, touchedCols: number,
+  rowsSelected: number, colsSelected: number,
+  totalRows: number, totalCols: number,
+): Classification["mode"] {
+  const isRow = fullRow && touchedRows >= 1;
+  const isCol = fullCol && touchedRows >= 2 && touchedCols >= 1;
+  if (isRow && isCol) {
+    if (rowsSelected === totalRows && colsSelected === totalCols) return "all";
+    if (totalRows === 0 || totalCols === 0) return "both";
+    const rowSat = rowsSelected / totalRows;
+    const colSat = colsSelected / totalCols;
+    if (colSat > rowSat) return "row";
+    if (rowSat > colSat) return "column";
+    return "both";
+  }
+  if (isRow) return "row";
+  if (isCol) return "column";
+  return "none";
 }
 
 // ---------- actions: read/select ----------
 
 function selectRow(): Response {
-  const ctx = getContext();
+  const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
   const cells = cellsAtRow(ctx.model, ctx.logical.rowIdx, true);
   if (cells.length === 0) return { ok: false, message: "В строке нет видимых ячеек" };
@@ -601,7 +629,7 @@ function selectRow(): Response {
 }
 
 function selectColumn(includeHeader: boolean): Response {
-  const ctx = getContext();
+  const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
   const cells = cellsAtCol(ctx.model, ctx.logical.colIdx, true, includeHeader);
   if (cells.length === 0) return { ok: false, message: "В столбце ничего не найдено" };
@@ -615,7 +643,7 @@ function selectColumn(includeHeader: boolean): Response {
 }
 
 function selectAll(includeHeader: boolean): Response {
-  const ctx = getContext();
+  const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
   const result: SceneNode[] = [];
   for (const lc of ctx.model.cells) {
@@ -640,147 +668,151 @@ function selectAll(includeHeader: boolean): Response {
 // сдвиг. Между переключениями оси сохраняется память о rowIdxs/colIdxs,
 // чтобы возврат к оси шёл к исходным позициям.
 function navigate(mode: "column" | "row", direction: "prev" | "next", includeHeader: boolean): Response {
-  const ctx = getContext();
-  if (!ctx || !anchorState) return { ok: false, message: "Это не похоже на таблицу" };
-  const model = ctx.model;
+  if (!cacheCtx || !anchorState) return { ok: false, message: "Это не похоже на таблицу" };
+  const model = cacheCtx.model;
+  const visIdxs = mode === "row" ? model.visibleRowIdxs : model.visibleColIdxs;
+  if (visIdxs.length === 0) {
+    return { ok: false, message: mode === "row" ? "Нет строк" : "Нет столбцов" };
+  }
+
+  applyAxisNav(mode, direction, includeHeader, model);
+
+  const result = buildAxisSelection(mode, model, includeHeader);
+  if (result.length === 0) return { ok: false, message: "Нет ячеек" };
+  setPluginSelection(result);
+
+  const idxs = mode === "row" ? anchorState.rowIdxs : anchorState.colIdxs;
+  const noun = mode === "row" ? "Ряд" : "Столбц";
+  const suffix = idxs.length > 1 ? "ы" : "";
+  return { ok: true, message: `${noun}${suffix}: ${result.length} ячеек` };
+}
+
+// Обновляет anchorState.{row|col}Idxs и axis для одной оси.
+// Первое нажатие в новой оси — трансформация (без сдвига).
+// Последующие — сдвиг с wrap-around.
+function applyAxisNav(
+  axis: "row" | "column",
+  direction: "prev" | "next",
+  includeHeader: boolean,
+  model: TableModel,
+): void {
+  if (!anchorState) return;
   const step = direction === "next" ? 1 : -1;
+  const visIdxs = axis === "row" ? model.visibleRowIdxs : model.visibleColIdxs;
+  const total = visIdxs.length;
+  const currentIdxs = axis === "row" ? anchorState.rowIdxs : anchorState.colIdxs;
 
-  if (mode === "row") {
-    const totalRows = model.visibleRowIdxs.length;
-    if (totalRows === 0) return { ok: false, message: "Нет строк" };
-
-    if (anchorState.axis !== "row") {
-      // Трансформация: выделить ряды по anchor.rowIdxs.
-      // Если anchor только в header и includeHeader=off — переходим на следующий по направлению.
-      let target = [...anchorState.rowIdxs];
-      const allInHeader = target.length > 0 && target.every((r) => r === model.headerRowIdx);
-      if (!includeHeader && allInHeader) {
-        const posOf = new Map<number, number>();
-        model.visibleRowIdxs.forEach((idx, i) => posOf.set(idx, i));
-        const hPos = posOf.get(model.headerRowIdx);
-        if (hPos !== undefined) {
-          let attempts = totalRows;
-          let p = hPos;
-          while (attempts-- > 0) {
-            p = ((p + step) % totalRows + totalRows) % totalRows;
-            if (model.visibleRowIdxs[p] !== model.headerRowIdx) {
-              target = [model.visibleRowIdxs[p]];
-              break;
-            }
+  let newIdxs: number[];
+  if (anchorState.axis !== axis) {
+    // Трансформация
+    let target = [...currentIdxs];
+    // Спец-кейс для row: если anchor сидит только на header и тоггл выключен —
+    // переезжаем на соседнюю не-header строку.
+    if (axis === "row" && !includeHeader && target.length > 0
+        && target.every((r) => r === model.headerRowIdx)) {
+      const posOf = positionMap(visIdxs);
+      const hPos = posOf.get(model.headerRowIdx);
+      if (hPos !== undefined) {
+        let attempts = total;
+        let p = hPos;
+        while (attempts-- > 0) {
+          p = ((p + step) % total + total) % total;
+          if (visIdxs[p] !== model.headerRowIdx) {
+            target = [visIdxs[p]];
+            break;
           }
         }
       }
-      anchorState.rowIdxs = target;
-      anchorState.axis = "row";
-    } else {
-      // Сдвиг каждого ряда по anchorState.rowIdxs
-      const posOf = new Map<number, number>();
-      model.visibleRowIdxs.forEach((idx, i) => posOf.set(idx, i));
-      const newSet = new Set<number>();
-      for (const idx of anchorState.rowIdxs) {
-        const pos = posOf.get(idx);
-        if (pos === undefined) continue;
-        const newPos = ((pos + step) % totalRows + totalRows) % totalRows;
-        newSet.add(model.visibleRowIdxs[newPos]);
-      }
-      anchorState.rowIdxs = [...newSet].sort((a, b) => a - b);
     }
-
-    const seen = new Set<string>();
-    const result: SceneNode[] = [];
-    for (const r of anchorState.rowIdxs) {
-      for (const c of cellsAtRow(model, r, true)) {
-        if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
-      }
-    }
-    if (result.length === 0) return { ok: false, message: "Нет ячеек" };
-    setPluginSelection(result);
-    return { ok: true, message: `Ряд${anchorState.rowIdxs.length > 1 ? "ы" : ""}: ${result.length} ячеек` };
-  }
-
-  // mode === "column"
-  const totalCols = model.visibleColIdxs.length;
-  if (totalCols === 0) return { ok: false, message: "Нет столбцов" };
-
-  if (anchorState.axis !== "column") {
-    // Трансформация: используем anchor.colIdxs как есть.
-    anchorState.axis = "column";
+    newIdxs = target;
+    anchorState.axis = axis;
   } else {
-    const posOf = new Map<number, number>();
-    model.visibleColIdxs.forEach((idx, i) => posOf.set(idx, i));
+    // Сдвиг
+    const posOf = positionMap(visIdxs);
     const newSet = new Set<number>();
-    for (const idx of anchorState.colIdxs) {
+    for (const idx of currentIdxs) {
       const pos = posOf.get(idx);
       if (pos === undefined) continue;
-      const newPos = ((pos + step) % totalCols + totalCols) % totalCols;
-      newSet.add(model.visibleColIdxs[newPos]);
+      const newPos = ((pos + step) % total + total) % total;
+      newSet.add(visIdxs[newPos]);
     }
-    anchorState.colIdxs = [...newSet].sort((a, b) => a - b);
+    newIdxs = [...newSet].sort((a, b) => a - b);
   }
 
+  if (axis === "row") anchorState.rowIdxs = newIdxs;
+  else anchorState.colIdxs = newIdxs;
+}
+
+// Собирает выделение из anchorState под текущую ось.
+function buildAxisSelection(
+  axis: "row" | "column", model: TableModel, includeHeader: boolean,
+): SceneNode[] {
+  if (!anchorState) return [];
+  const idxs = axis === "row" ? anchorState.rowIdxs : anchorState.colIdxs;
   const seen = new Set<string>();
   const result: SceneNode[] = [];
-  for (const cIdx of anchorState.colIdxs) {
-    for (const cell of cellsAtCol(model, cIdx, true, includeHeader)) {
-      if (!seen.has(cell.id)) { seen.add(cell.id); result.push(cell); }
+  for (const idx of idxs) {
+    const cells = axis === "row"
+      ? cellsAtRow(model, idx, true)
+      : cellsAtCol(model, idx, true, includeHeader);
+    for (const c of cells) {
+      if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
     }
   }
-  if (result.length === 0) return { ok: false, message: "Нет ячеек" };
-  setPluginSelection(result);
-  return { ok: true, message: `Столбц${anchorState.colIdxs.length > 1 ? "ы" : ""}: ${result.length} ячеек` };
+  return result;
+}
+
+function positionMap(idxs: number[]): Map<number, number> {
+  const m = new Map<number, number>();
+  idxs.forEach((idx, i) => m.set(idx, i));
+  return m;
 }
 
 // ---------- actions: shrink ----------
 
 function shrink(mode: "column" | "row", direction: "prev" | "next", includeHeader: boolean): Response {
-  const ctx = getContext();
-  if (!ctx || !anchorState) return { ok: false, message: "Это не похоже на таблицу" };
-  const model = ctx.model;
+  if (!cacheCtx || !anchorState) return { ok: false, message: "Это не похоже на таблицу" };
+  const model = cacheCtx.model;
 
   if (mode === "column") {
     if (anchorState.axis === "row") return { ok: false, message: "Нельзя сузить столбцы у строки" };
     if (anchorState.colIdxs.length < 2) return { ok: false, message: "Не из чего сужать" };
-    const sorted = [...anchorState.colIdxs].sort((a, b) => a - b);
-    if (direction === "prev") sorted.shift();
-    else sorted.pop();
-    anchorState.colIdxs = sorted;
+    anchorState.colIdxs = trimEdge(anchorState.colIdxs, direction);
   } else {
     if (anchorState.axis === "column") return { ok: false, message: "Нельзя сузить строки у столбца" };
     if (anchorState.rowIdxs.length < 2) return { ok: false, message: "Не из чего сужать" };
-    const sorted = [...anchorState.rowIdxs].sort((a, b) => a - b);
-    if (direction === "prev") sorted.shift();
-    else sorted.pop();
-    anchorState.rowIdxs = sorted;
+    anchorState.rowIdxs = trimEdge(anchorState.rowIdxs, direction);
   }
 
-  const seen = new Set<string>();
-  const result: SceneNode[] = [];
-  if (anchorState.axis === "row") {
-    for (const r of anchorState.rowIdxs) {
-      for (const c of cellsAtRow(model, r, true)) {
-        if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
-      }
-    }
-  } else if (anchorState.axis === "column") {
-    for (const cIdx of anchorState.colIdxs) {
-      for (const cell of cellsAtCol(model, cIdx, true, includeHeader)) {
-        if (!seen.has(cell.id)) { seen.add(cell.id); result.push(cell); }
-      }
-    }
-  } else {
-    // axis == null → прямоугольник rowIdxs × colIdxs (берём только видимые ячейки)
-    const rowSet = new Set(anchorState.rowIdxs);
-    const colSet = new Set(anchorState.colIdxs);
-    for (const lc of model.cells) {
-      if (!lc.visible) continue;
-      if (!rowSet.has(lc.rowIdx) || !colSet.has(lc.colIdx)) continue;
-      if (!seen.has(lc.node.id)) { seen.add(lc.node.id); result.push(lc.node); }
-    }
-  }
+  const result = anchorState.axis === "row" || anchorState.axis === "column"
+    ? buildAxisSelection(anchorState.axis, model, includeHeader)
+    : buildRectSelection(model);
 
   if (result.length === 0) return { ok: false, message: "Пусто после сужения" };
   setPluginSelection(result);
   return { ok: true, message: `Сужено: ${result.length} ячеек` };
+}
+
+function trimEdge(idxs: number[], direction: "prev" | "next"): number[] {
+  const sorted = [...idxs].sort((a, b) => a - b);
+  if (direction === "prev") sorted.shift();
+  else sorted.pop();
+  return sorted;
+}
+
+// Прямоугольное выделение из anchor.rowIdxs × anchor.colIdxs (видимые ячейки).
+function buildRectSelection(model: TableModel): SceneNode[] {
+  if (!anchorState) return [];
+  const rowSet = new Set(anchorState.rowIdxs);
+  const colSet = new Set(anchorState.colIdxs);
+  const seen = new Set<string>();
+  const result: SceneNode[] = [];
+  for (const lc of model.cells) {
+    if (!lc.visible) continue;
+    if (!rowSet.has(lc.rowIdx) || !colSet.has(lc.colIdx)) continue;
+    if (!seen.has(lc.node.id)) { seen.add(lc.node.id); result.push(lc.node); }
+  }
+  return result;
 }
 
 // ---------- actions: clear selection ----------
@@ -794,7 +826,7 @@ function clearSelection(): Response {
 // ---------- actions: expand ----------
 
 function expand(mode: "column" | "row", direction: "prev" | "next", includeHeader: boolean): Response {
-  const ctx = getContext();
+  const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
   const cls = classifySelection();
   const model = ctx.model;
@@ -858,7 +890,7 @@ function toggleHeader(includeHeader: boolean): Response {
   if (sel.length === 0) {
     return { ok: true, message: `Заголовок: ${includeHeader ? "включён" : "выключен"}` };
   }
-  const ctx = getContext();
+  const ctx = cacheCtx;
   if (!ctx) {
     return { ok: true, message: `Заголовок: ${includeHeader ? "включён" : "выключен"}` };
   }
@@ -949,7 +981,7 @@ function addColumnGrid(model: TableModel, anchorColIdx: number, direction: "prev
 }
 
 function addColumn(direction: "prev" | "next"): Response {
-  const ctx = getContext();
+  const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
 
   const sel = figma.currentPage.selection;
@@ -1024,7 +1056,7 @@ function addRowGrid(model: TableModel, anchorRowIdx: number, direction: "prev" |
 }
 
 function addRow(direction: "prev" | "next"): Response {
-  const ctx = getContext();
+  const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
 
   const sel = figma.currentPage.selection;
@@ -1215,7 +1247,7 @@ function moveColumnStack(model: TableModel, rotation: Map<number, number>): bool
 }
 
 function moveColumn(direction: "prev" | "next"): Response {
-  const ctx = getContext();
+  const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
   if (ctx.model.type === "grid") {
     return { ok: false, message: "Перемещение в grid-таблицах пока не поддерживается" };
@@ -1265,7 +1297,7 @@ function moveRowStack(model: TableModel, rotation: Map<number, number>): boolean
 }
 
 function moveRow(direction: "prev" | "next"): Response {
-  const ctx = getContext();
+  const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
   if (ctx.model.type === "grid") {
     return { ok: false, message: "Перемещение в grid-таблицах пока не поддерживается" };
@@ -1318,7 +1350,7 @@ function computeNavState(): NavState {
 
   const figmaSel = figma.currentPage.selection;
   const sel = effectiveSelection();
-  const ctx = getContext();
+  const ctx = cacheCtx;
   const hasCell = ctx !== null;
 
   if (hasCell) state.canSelectAll = true;
@@ -1441,42 +1473,63 @@ figma.on("selectionchange", () => {
   // без кеша каждый из них пересчитывает buildStackModel заново.
   invalidateModelCache();
 
-  // Это наше изменение selection или пользовательское?
   const currentIds = figma.currentPage.selection.map((n) => n.id);
-  let isOurChange = false;
-  if (lastPluginSelectionIds !== null && currentIds.length === lastPluginSelectionIds.size) {
-    isOurChange = currentIds.every((id) => lastPluginSelectionIds!.has(id));
-  }
+  const isOurChange = matchesLastPluginSelection(currentIds);
   lastPluginSelectionIds = null;
 
   refreshCache();
   if (!isOurChange) {
     refreshAnchorFromSelection();
-    // Если effective-selection отличается от настоящего figma-выделения,
-    // значит пользователь выделил row-контейнер (или несколько). Запоминаем
-    // ячейки на которые надо переключиться при первом нажатии на action-кнопку.
+    // Если effective-selection отличается от figma-выделения, значит юзер выделил
+    // row-контейнер. Запоминаем cells для двухшагового коммита по action-кнопке.
     const eff = effectiveSelection();
-    const effIds = new Set(eff.map((n) => n.id));
-    const figmaIds = new Set(currentIds);
-    let differs = effIds.size !== figmaIds.size;
-    if (!differs) {
-      for (const id of figmaIds) {
-        if (!effIds.has(id)) { differs = true; break; }
-      }
-    }
-    pendingContainerCells = differs ? eff : null;
+    pendingContainerCells = idsDiffer(eff.map((n) => n.id), currentIds) ? eff : null;
   }
   pushNavState();
   pushStatusFromSelection();
 });
 
-figma.ui.onmessage = async (msg: { type: string; includeHeader?: boolean; mode?: "column" | "row"; direction?: "prev" | "next" }) => {
-  let response: Response | undefined;
+function matchesLastPluginSelection(currentIds: string[]): boolean {
+  if (lastPluginSelectionIds === null || currentIds.length !== lastPluginSelectionIds.size) return false;
+  return currentIds.every((id) => lastPluginSelectionIds!.has(id));
+}
 
+function idsDiffer(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return true;
+  const setA = new Set(a);
+  for (const id of b) if (!setA.has(id)) return true;
+  return false;
+}
+
+type UiMessage = {
+  type: string;
+  includeHeader?: boolean;
+  mode?: "column" | "row";
+  direction?: "prev" | "next";
+};
+
+// Action-кнопки секций (двухшаговые при выделенном row-контейнере).
+const TWO_STEP_ACTIONS = new Set(["nav", "expand", "shrink", "add", "move"]);
+
+// Маппинг msg.type → обработчик. Возвращает Response или undefined (если
+// сообщение незнакомое).
+const ACTIONS: { [k: string]: (m: UiMessage) => Response } = {
+  "select-row": () => selectRow(),
+  "select-column": (m) => selectColumn(m.includeHeader === true),
+  "select-all": (m) => selectAll(m.includeHeader === true),
+  "clear-selection": () => clearSelection(),
+  "toggle-header": (m) => toggleHeader(m.includeHeader === true),
+  "nav": (m) => navigate(m.mode!, m.direction!, m.includeHeader === true),
+  "expand": (m) => expand(m.mode!, m.direction!, m.includeHeader === true),
+  "shrink": (m) => shrink(m.mode!, m.direction!, m.includeHeader === true),
+  "add": (m) => m.mode === "column" ? addColumn(m.direction!) : addRow(m.direction!),
+  "move": (m) => m.mode === "column" ? moveColumn(m.direction!) : moveRow(m.direction!),
+};
+
+figma.ui.onmessage = async (msg: UiMessage) => {
   if (msg.type === "init") {
     const stored = await figma.clientStorage.getAsync(STORAGE_KEY_INCLUDE_HEADER);
-    const value = stored === undefined ? true : Boolean(stored);
-    figma.ui.postMessage({ type: "init-state", includeHeader: value });
+    figma.ui.postMessage({ type: "init-state", includeHeader: stored === undefined ? true : Boolean(stored) });
     refreshCache();
     refreshAnchorFromSelection();
     pushNavState();
@@ -1484,12 +1537,9 @@ figma.ui.onmessage = async (msg: { type: string; includeHeader?: boolean; mode?:
     return;
   }
 
-  // Двухшаговая логика для row-контейнеров: если выделение содержит контейнер,
-  // первое нажатие на action-кнопку только фиксирует ячейки в Figma. Сам
-  // запрос не выполняется, его надо нажать ещё раз.
-  const isTwoStepAction = msg.type === "nav" || msg.type === "expand"
-    || msg.type === "shrink" || msg.type === "add" || msg.type === "move";
-  if (isTwoStepAction && pendingContainerCells !== null) {
+  // Двухшаговый коммит для row-контейнеров: первое нажатие переводит figma-выделение
+  // на ячейки, сам action не выполняется. Следующее нажатие — уже action.
+  if (TWO_STEP_ACTIONS.has(msg.type) && pendingContainerCells !== null) {
     const cells = pendingContainerCells;
     pendingContainerCells = null;
     setPluginSelection(cells);
@@ -1500,27 +1550,8 @@ figma.ui.onmessage = async (msg: { type: string; includeHeader?: boolean; mode?:
     return;
   }
 
-  if (msg.type === "select-row") {
-    response = selectRow();
-  } else if (msg.type === "select-column") {
-    response = selectColumn(msg.includeHeader === true);
-  } else if (msg.type === "select-all") {
-    response = selectAll(msg.includeHeader === true);
-  } else if (msg.type === "clear-selection") {
-    response = clearSelection();
-  } else if (msg.type === "nav" && msg.mode && msg.direction) {
-    response = navigate(msg.mode, msg.direction, msg.includeHeader === true);
-  } else if (msg.type === "expand" && msg.mode && msg.direction) {
-    response = expand(msg.mode, msg.direction, msg.includeHeader === true);
-  } else if (msg.type === "shrink" && msg.mode && msg.direction) {
-    response = shrink(msg.mode, msg.direction, msg.includeHeader === true);
-  } else if (msg.type === "toggle-header") {
-    response = toggleHeader(msg.includeHeader === true);
-  } else if (msg.type === "add" && msg.mode && msg.direction) {
-    response = msg.mode === "column" ? addColumn(msg.direction) : addRow(msg.direction);
-  } else if (msg.type === "move" && msg.mode && msg.direction) {
-    response = msg.mode === "column" ? moveColumn(msg.direction) : moveRow(msg.direction);
-  }
+  const handler = ACTIONS[msg.type];
+  const response = handler ? handler(msg) : undefined;
 
   if (response) {
     pushNavState();
