@@ -28,6 +28,9 @@ type NavState = {
   canMoveColRight: boolean;
   canMoveRowUp: boolean;
   canMoveRowDown: boolean;
+  canCopyCsv: boolean;
+  canConvert: boolean;
+  tableType: TableType | null;
 };
 
 // «Якорь» — память о том, какие ряды/столбцы пользователь подразумевал
@@ -349,12 +352,49 @@ function getRowCellsIfRowContainer(node: SceneNode): SceneNode[] | null {
   return null;
 }
 
+// Если node — это body таблицы (grid или stack), возвращает все её видимые
+// ячейки. Используется чтобы клик по корневому фрейму таблицы работал
+// как «выделить все ячейки», а не как «это не таблица».
+//
+// Тонкость: если parent(node) содержит несколько таблиц-сестёр (stack + grid
+// рядом), buildStackModel(parent) может вернуть false-positive мета-модель,
+// где наши «настоящие» body становятся «строками». findTableContext(direct
+// child) тогда возвращает эту мета-модель раньше реальной. Поэтому ищем
+// в два прохода: сперва direct children (grid случай), затем grand-children
+// (stack — там cell на уровень глубже, и findTableContext доходит до
+// реальной модели до того как успеет наткнуться на мета).
+function getCellsIfBodyContainer(node: SceneNode): SceneNode[] | null {
+  if (!("children" in node)) return null;
+  const childMixin = node as SceneNode & ChildrenMixin;
+  if (childMixin.children.length === 0) return null;
+
+  // Pass 1: direct children как кандидаты в cell (grid-случай).
+  for (const child of childMixin.children) {
+    const ctx = findTableContext(child as SceneNode);
+    if (ctx && ctx.model.body.id === node.id) {
+      return ctx.model.cells.filter((lc) => lc.visible).map((lc) => lc.node);
+    }
+  }
+  // Pass 2: grand-children как кандидаты в cell (stack-случай, ребёнок body —
+  // это row-контейнер, а cell лежит внутри row).
+  for (const child of childMixin.children) {
+    if (!("children" in child)) continue;
+    for (const gc of (child as SceneNode & ChildrenMixin).children) {
+      const ctx = findTableContext(gc as SceneNode);
+      if (ctx && ctx.model.body.id === node.id) {
+        return ctx.model.cells.filter((lc) => lc.visible).map((lc) => lc.node);
+      }
+    }
+  }
+  return null;
+}
+
 // "Эффективное выделение": возвращает ячейки, на которые ссылается текущее
-// Figma-выделение. Row-контейнеры виртуально разворачиваются в свои ячейки.
-// САМО выделение в Figma не меняется — это только внутренняя интерпретация.
-// Мемоизировано по signature текущего selection: вызов ~5-6 раз за цикл
-// (refreshCache, refreshAnchor, classify, computeNavState и т.д.), без
-// кеша каждый раз пересчитывался бы один и тот же ответ.
+// Figma-выделение. Row-контейнеры и body-контейнеры виртуально разворачиваются
+// в свои ячейки. САМО выделение в Figma не меняется — это только внутренняя
+// интерпретация. Мемоизировано по signature текущего selection: вызов ~5-6
+// раз за цикл (refreshCache, refreshAnchor, classify, computeNavState и т.д.),
+// без кеша каждый раз пересчитывался бы один и тот же ответ.
 let effectiveSelCache: { sig: string; result: SceneNode[] } | null = null;
 
 function effectiveSelection(): SceneNode[] {
@@ -368,10 +408,13 @@ function effectiveSelection(): SceneNode[] {
   const result: SceneNode[] = [];
   for (const n of sel) {
     if (seen.has(n.id)) continue;
-    const rowCells = getRowCellsIfRowContainer(n);
-    if (rowCells && rowCells.length > 0) {
+    // Body-чек идёт первым: если node — это body таблицы, мы не должны
+    // тащить его через row-логику (где false-positive мета-модель может
+    // соматчить наше body как «строку» и заселектить чужие ячейки).
+    const expanded = getCellsIfBodyContainer(n) || getRowCellsIfRowContainer(n);
+    if (expanded && expanded.length > 0) {
       changed = true;
-      for (const c of rowCells) {
+      for (const c of expanded) {
         if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
       }
     } else {
@@ -614,32 +657,91 @@ function pickMode(
 
 // ---------- actions: read/select ----------
 
-function selectRow(): Response {
-  const ctx = cacheCtx;
-  if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
-  const cells = cellsAtRow(ctx.model, ctx.logical.rowIdx, true);
-  if (cells.length === 0) return { ok: false, message: "В строке нет видимых ячеек" };
+// Возвращает первый видимый ряд, который не является header'ом (если includeHeader=off).
+// Если includeHeader=on или нет других рядов — возвращает первый видимый.
+function firstSelectableRow(model: TableModel, includeHeader: boolean): number | null {
+  if (model.visibleRowIdxs.length === 0) return null;
+  const first = model.visibleRowIdxs[0];
+  if (includeHeader || first !== model.headerRowIdx) return first;
+  for (const r of model.visibleRowIdxs) {
+    if (r !== model.headerRowIdx) return r;
+  }
+  return first; // только header видимый — fallback
+}
+
+function selectRow(includeHeader: boolean): Response {
+  if (!cacheCtx) return { ok: false, message: "Это не похоже на таблицу" };
+  const model = cacheCtx.model;
+  const cls = classifySelection();
+
+  let targetRowIdxs: number[];
+  if (cls.mode === "all") {
+    // Body/all-selected: первый видимый ряд с учётом header-тоггла.
+    const r = firstSelectableRow(model, includeHeader);
+    if (r === null) return { ok: false, message: "Нет видимых рядов" };
+    targetRowIdxs = [r];
+  } else if (anchorState) {
+    // Используем anchor.rowIdxs — повторяем логику nav-трансформации.
+    targetRowIdxs = [...anchorState.rowIdxs];
+    // Если получился только header, а тоггл выключен — переходим к следующему ряду.
+    if (!includeHeader && targetRowIdxs.length === 1 && targetRowIdxs[0] === model.headerRowIdx) {
+      const r = firstSelectableRow(model, includeHeader);
+      if (r !== null) targetRowIdxs = [r];
+    }
+  } else {
+    targetRowIdxs = [cacheCtx.logical.rowIdx];
+  }
+
+  const seen = new Set<string>();
+  const result: SceneNode[] = [];
+  for (const r of targetRowIdxs) {
+    for (const c of cellsAtRow(model, r, true)) {
+      if (!seen.has(c.id)) { seen.add(c.id); result.push(c); }
+    }
+  }
+  if (result.length === 0) return { ok: false, message: "В строке нет видимых ячеек" };
+
   anchorState = {
-    rowIdxs: [ctx.logical.rowIdx],
-    colIdxs: [ctx.logical.colIdx],
+    rowIdxs: targetRowIdxs,
+    colIdxs: anchorState ? [...anchorState.colIdxs] : [cacheCtx.logical.colIdx],
     axis: "row",
   };
-  setPluginSelection(cells);
-  return { ok: true, message: `Выделена строка: ${cells.length} ячеек` };
+  setPluginSelection(result);
+  return { ok: true, message: `Выделена строка: ${result.length} ячеек` };
 }
 
 function selectColumn(includeHeader: boolean): Response {
-  const ctx = cacheCtx;
-  if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
-  const cells = cellsAtCol(ctx.model, ctx.logical.colIdx, true, includeHeader);
-  if (cells.length === 0) return { ok: false, message: "В столбце ничего не найдено" };
+  if (!cacheCtx) return { ok: false, message: "Это не похоже на таблицу" };
+  const model = cacheCtx.model;
+  const cls = classifySelection();
+
+  let targetColIdxs: number[];
+  if (cls.mode === "all") {
+    // Body/all-selected: крайний левый видимый столбец.
+    if (model.visibleColIdxs.length === 0) return { ok: false, message: "Нет видимых столбцов" };
+    targetColIdxs = [model.visibleColIdxs[0]];
+  } else if (anchorState) {
+    targetColIdxs = [...anchorState.colIdxs];
+  } else {
+    targetColIdxs = [cacheCtx.logical.colIdx];
+  }
+
+  const seen = new Set<string>();
+  const result: SceneNode[] = [];
+  for (const cIdx of targetColIdxs) {
+    for (const cell of cellsAtCol(model, cIdx, true, includeHeader)) {
+      if (!seen.has(cell.id)) { seen.add(cell.id); result.push(cell); }
+    }
+  }
+  if (result.length === 0) return { ok: false, message: "В столбце ничего не найдено" };
+
   anchorState = {
-    rowIdxs: [ctx.logical.rowIdx],
-    colIdxs: [ctx.logical.colIdx],
+    rowIdxs: anchorState ? [...anchorState.rowIdxs] : [cacheCtx.logical.rowIdx],
+    colIdxs: targetColIdxs,
     axis: "column",
   };
-  setPluginSelection(cells);
-  return { ok: true, message: `Выделен столбец: ${cells.length} ячеек` };
+  setPluginSelection(result);
+  return { ok: true, message: `Выделен столбец: ${result.length} ячеек` };
 }
 
 function selectAll(includeHeader: boolean): Response {
@@ -823,6 +925,370 @@ function clearSelection(): Response {
   return { ok: true, message: "Выделение снято" };
 }
 
+// ---------- actions: convert table type ----------
+
+// Описание sizing-режима трека/ячейки — общий вид для маппинга stack↔grid.
+type TrackSizing =
+  | { type: "FLEX"; value: number }
+  | { type: "FIXED"; value: number }
+  | { type: "HUG" };
+
+// Снимок sizing-режима ячейки stack-таблицы по её горизонтальной оси
+// (то, как ячейка ведёт себя внутри row-контейнера). Используется для
+// определения sizing колонки в grid.
+function sampleHorizontalSizing(cell: SceneNode): TrackSizing {
+  const mode = (cell as { layoutSizingHorizontal?: string }).layoutSizingHorizontal;
+  if (mode === "FILL") return { type: "FLEX", value: 1 };
+  if (mode === "HUG") return { type: "HUG" };
+  return { type: "FIXED", value: Math.max(1, Math.round(cell.width)) };
+}
+
+// Аналогично для вертикальной оси row-контейнера → grid строка.
+function sampleVerticalSizing(rowNode: SceneNode): TrackSizing {
+  const mode = (rowNode as { layoutSizingVertical?: string }).layoutSizingVertical;
+  if (mode === "FILL") return { type: "FLEX", value: 1 };
+  if (mode === "HUG") return { type: "HUG" };
+  return { type: "FIXED", value: Math.max(1, Math.round(rowNode.height)) };
+}
+
+// Применить sizing к одному grid-треку.
+function applyGridTrack(track: GridTrackSize, sizing: TrackSizing): void {
+  if (sizing.type === "HUG") {
+    track.type = "HUG";
+  } else if (sizing.type === "FLEX") {
+    track.type = "FLEX";
+    track.value = sizing.value;
+  } else {
+    track.type = "FIXED";
+    track.value = sizing.value;
+  }
+}
+
+// Снимок grid-трека в формате TrackSizing.
+function snapshotGridTrack(track: GridTrackSize): TrackSizing {
+  if (track.type === "HUG") return { type: "HUG" };
+  if (track.type === "FLEX") return { type: "FLEX", value: track.value ?? 1 };
+  return { type: "FIXED", value: track.value ?? 1 };
+}
+
+// Применить TrackSizing к ячейке в stack-row-контейнере (горизонталь).
+// FLEX≥1 → FILL, HUG → HUG, FLEX<1 → FIXED по текущему рендеренному размеру,
+// FIXED → FIXED (значение в пикселях сохраняется как есть).
+function applyHorizontalToCell(cell: SceneNode, sizing: TrackSizing): void {
+  if (!("layoutSizingHorizontal" in cell)) return;
+  const f = cell as { layoutSizingHorizontal: "FIXED" | "HUG" | "FILL" };
+  try {
+    if (sizing.type === "HUG") {
+      f.layoutSizingHorizontal = "HUG";
+    } else if (sizing.type === "FLEX") {
+      if (sizing.value >= 1) {
+        f.layoutSizingHorizontal = "FILL";
+      } else {
+        f.layoutSizingHorizontal = "FIXED";
+      }
+    } else {
+      f.layoutSizingHorizontal = "FIXED";
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// Аналогично для вертикали row-контейнера.
+function applyVerticalToRow(rowNode: SceneNode, sizing: TrackSizing): void {
+  if (!("layoutSizingVertical" in rowNode)) return;
+  const f = rowNode as { layoutSizingVertical: "FIXED" | "HUG" | "FILL" };
+  try {
+    if (sizing.type === "HUG") {
+      f.layoutSizingVertical = "HUG";
+    } else if (sizing.type === "FLEX") {
+      if (sizing.value >= 1) {
+        f.layoutSizingVertical = "FILL";
+      } else {
+        f.layoutSizingVertical = "FIXED";
+      }
+    } else {
+      f.layoutSizingVertical = "FIXED";
+    }
+  } catch (e) { /* ignore */ }
+}
+
+// Снимок sizing-режимов body. layoutSizingHorizontal/Vertical валидны только
+// если родитель — auto-layout фрейм. Иначе сохраняем undefined и при
+// восстановлении просто ресайзим до изначальных width/height.
+type BodySizingSnapshot = {
+  h: "FIXED" | "HUG" | "FILL" | undefined;
+  v: "FIXED" | "HUG" | "FILL" | undefined;
+  width: number;
+  height: number;
+};
+
+function snapshotBodySizing(body: FrameNode): BodySizingSnapshot {
+  let h: "FIXED" | "HUG" | "FILL" | undefined;
+  let v: "FIXED" | "HUG" | "FILL" | undefined;
+  try { h = body.layoutSizingHorizontal; } catch (e) { /* ignore */ }
+  try { v = body.layoutSizingVertical; } catch (e) { /* ignore */ }
+  return { h, v, width: body.width, height: body.height };
+}
+
+function restoreBodySizing(body: FrameNode, snap: BodySizingSnapshot): void {
+  // Сначала возвращаем размеры (на случай FIXED) — иначе ресайз через
+  // layoutSizing не отработает корректно.
+  try { body.resize(Math.max(1, snap.width), Math.max(1, snap.height)); } catch (e) {}
+  try { if (snap.h !== undefined) body.layoutSizingHorizontal = snap.h; } catch (e) {}
+  try { if (snap.v !== undefined) body.layoutSizingVertical = snap.v; } catch (e) {}
+}
+
+function convertTable(): Response {
+  if (!cacheCtx) return { ok: false, message: "Это не похоже на таблицу" };
+  const model = cacheCtx.model;
+  try {
+    if (model.type === "stack") {
+      const ok = convertStackToGrid(model);
+      if (!ok) return { ok: false, message: "Не удалось преобразовать в Grid" };
+      invalidateModelCache();
+      refreshCache();
+      refreshAnchorFromSelection();
+      return { ok: true, message: "Таблица преобразована в Grid" };
+    } else {
+      const ok = convertGridToStack(model);
+      if (!ok) return { ok: false, message: "Не удалось преобразовать в Stack" };
+      invalidateModelCache();
+      refreshCache();
+      refreshAnchorFromSelection();
+      return { ok: true, message: "Таблица преобразована в Stack" };
+    }
+  } catch (e) {
+    return { ok: false, message: "Ошибка при преобразовании" };
+  }
+}
+
+function convertStackToGrid(model: TableModel): boolean {
+  const body = model.body as FrameNode;
+
+  // Учитываем только видимые ячейки — скрытые удалим.
+  const visibleCells = model.cells.filter((lc) => lc.visible);
+  if (visibleCells.length === 0) return false;
+
+  const visRowSet = new Set(visibleCells.map((lc) => lc.rowIdx));
+  const visColSet = new Set(visibleCells.map((lc) => lc.colIdx));
+  const visRowIdxs = [...visRowSet].sort((a, b) => a - b);
+  const visColIdxs = [...visColSet].sort((a, b) => a - b);
+  const rowCount = visRowIdxs.length;
+  const colCount = visColIdxs.length;
+
+  // Маппинг старых rowIdx/colIdx → 0-based contiguous (на случай если у скрытых
+  // ячеек были индексы внутри диапазона).
+  const rowIdxMap = new Map<number, number>();
+  visRowIdxs.forEach((oldIdx, newIdx) => rowIdxMap.set(oldIdx, newIdx));
+  const colIdxMap = new Map<number, number>();
+  visColIdxs.forEach((oldIdx, newIdx) => colIdxMap.set(oldIdx, newIdx));
+
+  // Захватываем sizing-режимы колонок (по первой видимой ячейке в столбце)
+  // и строк (по row-контейнеру). FILL→FLEX 1, HUG→HUG, FIXED→FIXED(px).
+  const colSizing: TrackSizing[] = visColIdxs.map((c) => {
+    const sample = visibleCells.find((lc) => lc.colIdx === c);
+    return sample ? sampleHorizontalSizing(sample.node) : { type: "FIXED", value: 100 };
+  });
+  const rowSizing: TrackSizing[] = visRowIdxs.map((r) => {
+    const rowNode = model.rowNodeByIdx.get(r);
+    return rowNode ? sampleVerticalSizing(rowNode) : { type: "FIXED", value: 20 };
+  });
+
+  // Список ячеек с их новыми grid-позициями, отсортирован row-major.
+  const cellsWithPos = visibleCells.map((lc) => ({
+    node: lc.node,
+    r: rowIdxMap.get(lc.rowIdx)!,
+    c: colIdxMap.get(lc.colIdx)!,
+  })).sort((a, b) => (a.r !== b.r ? a.r - b.r : a.c - b.c));
+
+  // Снимок sizing body — после смены layoutMode восстановим, чтобы HUG/FILL
+  // не потерялись.
+  const bodySnap = snapshotBodySizing(body);
+
+  // Шаг 1: удаляем скрытые ячейки.
+  for (const lc of model.cells) {
+    if (!lc.visible) {
+      try { lc.node.remove(); } catch (e) { /* ignore */ }
+    }
+  }
+
+  // Шаг 2: ВЫНОСИМ все видимые ячейки во временного родителя (currentPage),
+  // чтобы body опустел. Без этого Figma при смене layoutMode="GRID" назначит
+  // ячейкам gridColumnAnchorIndex=0 (т.к. дефолтный gridColumnCount=1) — а
+  // последующее изменение gridColumnCount уже не двигает их → весь грид
+  // схлопывается в одну колонку.
+  for (const { node } of cellsWithPos) {
+    figma.currentPage.appendChild(node);
+  }
+
+  // Шаг 3: удаляем теперь пустые row-контейнеры. Body становится полностью пустым.
+  for (const rc of [...model.rowNodeByIdx.values()]) {
+    try { rc.remove(); } catch (e) { /* ignore */ }
+  }
+
+  // Шаг 4: переключаем пустой body на GRID layout и выставляем счётчики треков
+  // ДО возвращения ячеек.
+  body.layoutMode = "GRID";
+  body.gridRowCount = rowCount;
+  body.gridColumnCount = colCount;
+
+  // Шаг 5: применяем захваченные sizing-режимы к grid-трекам.
+  try {
+    const colSizes = body.gridColumnSizes;
+    for (let i = 0; i < colSizes.length && i < colSizing.length; i++) {
+      applyGridTrack(colSizes[i], colSizing[i]);
+    }
+    const rowSizes = body.gridRowSizes;
+    for (let i = 0; i < rowSizes.length && i < rowSizing.length; i++) {
+      applyGridTrack(rowSizes[i], rowSizing[i]);
+    }
+  } catch (e) { /* gridRowSizes may not always be writable */ }
+
+  // Шаг 6: возвращаем ячейки в body, явно задавая grid-позицию каждой.
+  for (const { node, r, c } of cellsWithPos) {
+    body.appendChild(node);
+    try {
+      (node as unknown as { setGridChildPosition: (rr: number, cc: number) => void })
+        .setGridChildPosition(r, c);
+    } catch (e) {
+      // Auto-tracks ROWS mode — setGridChildPosition throws. В этом режиме
+      // позиция определяется порядком в body.children, который у нас row-major
+      // (сортировка cellsWithPos выше), так что результат остаётся корректным.
+    }
+  }
+
+  // Шаг 7: восстанавливаем sizing body (HUG/FILL/FIXED унаследованы от стека).
+  restoreBodySizing(body, bodySnap);
+
+  return true;
+}
+
+function convertGridToStack(model: TableModel): boolean {
+  const body = model.body as FrameNode;
+  const allRows = [...model.allRowIdxs].sort((a, b) => a - b);
+  const allCols = [...model.allColIdxs].sort((a, b) => a - b);
+  if (allRows.length === 0) return false;
+
+  // 1. Захватываем sizing-режимы grid-треков ДО смены layoutMode
+  // (после переключения gridColumnSizes/gridRowSizes будут пустыми).
+  const colSizing: TrackSizing[] = [];
+  try {
+    for (const t of body.gridColumnSizes) colSizing.push(snapshotGridTrack(t));
+  } catch (e) { /* пустой массив — fallback к unchanged */ }
+  const rowSizing: TrackSizing[] = [];
+  try {
+    for (const t of body.gridRowSizes) rowSizing.push(snapshotGridTrack(t));
+  } catch (e) { /* same */ }
+
+  // 2. Снимок sizing body для восстановления после переключения layoutMode.
+  const bodySnap = snapshotBodySizing(body);
+
+  // 3. Группируем ячейки по строкам.
+  const cellsByRow = new Map<number, LogicalCell[]>();
+  for (const lc of model.cells) {
+    let bucket = cellsByRow.get(lc.rowIdx);
+    if (!bucket) { bucket = []; cellsByRow.set(lc.rowIdx, bucket); }
+    bucket.push(lc);
+  }
+  for (const lcs of cellsByRow.values()) {
+    lcs.sort((a, b) => a.colIdx - b.colIdx);
+  }
+
+  // 4. Переключаем body на VERTICAL. Sizing восстановим в шаге 8.
+  body.layoutMode = "VERTICAL";
+
+  // 5. Создаём row-фреймы и переносим ячейки в них.
+  let isFirst = true;
+  const rowFrameByIdx = new Map<number, FrameNode>();
+  for (const r of allRows) {
+    const lcs = cellsByRow.get(r);
+    if (!lcs || lcs.length === 0) continue;
+    const rowFrame = figma.createFrame();
+    rowFrame.name = isFirst ? "Header" : "Row";
+    isFirst = false;
+    rowFrame.fills = [];
+    body.appendChild(rowFrame);
+    rowFrame.layoutMode = "HORIZONTAL";
+    rowFrame.layoutSizingHorizontal = "FILL";
+    rowFrame.layoutSizingVertical = "HUG"; // дефолт; перебьётся ниже по rowSizing
+    for (const lc of lcs) {
+      rowFrame.appendChild(lc.node);
+    }
+    rowFrameByIdx.set(r, rowFrame);
+  }
+
+  // 6. Применяем grid row sizing к layoutSizingVertical row-контейнера.
+  for (let i = 0; i < allRows.length; i++) {
+    const rowFrame = rowFrameByIdx.get(allRows[i]);
+    if (!rowFrame) continue;
+    const sizing = rowSizing[i];
+    if (sizing) applyVerticalToRow(rowFrame, sizing);
+  }
+
+  // 7. Применяем grid column sizing к layoutSizingHorizontal каждой ячейки
+  // в соответствующем столбце. Ячейки теперь в горизонтальных row-фреймах,
+  // поэтому layoutSizingHorizontal у них валиден.
+  for (let i = 0; i < allCols.length; i++) {
+    const c = allCols[i];
+    const sizing = colSizing[i];
+    if (!sizing) continue;
+    for (const lc of model.cells) {
+      if (lc.colIdx === c) applyHorizontalToCell(lc.node, sizing);
+    }
+  }
+
+  // 8. Восстанавливаем sizing body (HUG/FILL/FIXED унаследованы от grid).
+  restoreBodySizing(body, bodySnap);
+
+  return true;
+}
+
+// ---------- actions: copy CSV ----------
+
+// Рекурсивно ищет первый встретившийся TextNode в поддереве.
+function findFirstTextNode(node: BaseNode): TextNode | null {
+  if (node.type === "TEXT") return node as TextNode;
+  if ("children" in node) {
+    for (const c of (node as ChildrenMixin).children) {
+      const r = findFirstTextNode(c);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
+function csvEscape(s: string): string {
+  if (/[",\n\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+// Возвращает CSV-представление текущего effective-выделения, либо null если
+// в выделении нет ячеек таблицы.
+function buildCsvFromSelection(): string | null {
+  if (!cacheCtx) return null;
+  const model = cacheCtx.model;
+  const sel = effectiveSelection();
+  const cellsByRow = new Map<number, Map<number, string>>();
+  for (const n of sel) {
+    if (!isVisible(n)) continue;
+    const lc = model.cellByNodeId.get(n.id);
+    if (!lc || !lc.visible) continue;
+    const tn = findFirstTextNode(n);
+    const text = tn ? tn.characters : "";
+    let row = cellsByRow.get(lc.rowIdx);
+    if (!row) { row = new Map(); cellsByRow.set(lc.rowIdx, row); }
+    row.set(lc.colIdx, text);
+  }
+  if (cellsByRow.size === 0) return null;
+  const rowKeys = [...cellsByRow.keys()].sort((a, b) => a - b);
+  const lines: string[] = [];
+  for (const r of rowKeys) {
+    const row = cellsByRow.get(r)!;
+    const colKeys = [...row.keys()].sort((a, b) => a - b);
+    lines.push(colKeys.map((c) => csvEscape(row.get(c) || "")).join(","));
+  }
+  return lines.join("\n");
+}
+
 // ---------- actions: expand ----------
 
 function expand(mode: "column" | "row", direction: "prev" | "next", includeHeader: boolean): Response {
@@ -963,20 +1429,44 @@ function addColumnGrid(model: TableModel, anchorColIdx: number, direction: "prev
   const cellByPos = new Map<string, SceneNode>();
   for (const lc of model.cells) cellByPos.set(`${lc.rowIdx},${lc.colIdx}`, lc.node);
 
+  if (isGridFixedTracks(model)) {
+    // FIXED треки: явно управляем grid-позициями.
+    // 1) Сдвигаем ячейки с colIdx >= newColIdx вправо (по убыванию).
+    // 2) Бамп gridColumnCount.
+    // 3) Клонируем якорные ячейки и явно ставим setGridChildPosition.
+    body.gridColumnCount = C + 1;
+    const toShift = [...model.cells]
+      .filter((lc) => lc.colIdx >= newColIdx)
+      .sort((a, b) => b.colIdx - a.colIdx);
+    for (const lc of toShift) {
+      (lc.node as unknown as { setGridChildPosition: (r: number, c: number) => void })
+        .setGridChildPosition(lc.rowIdx, lc.colIdx + 1);
+    }
+    const newCells: SceneNode[] = [];
+    for (let r = 0; r < N; r++) {
+      const src = cellByPos.get(`${r},${anchorColIdx}`);
+      if (!src) continue;
+      const clone = src.clone();
+      body.appendChild(clone);
+      (clone as unknown as { setGridChildPosition: (rr: number, cc: number) => void })
+        .setGridChildPosition(r, newColIdx);
+      newCells.push(clone);
+    }
+    return newCells;
+  }
+
+  // AUTO-ROWS: gridColumnCount можно менять, setGridChildPosition нельзя.
+  // Вставляем клоны в нужные позиции children, затем бампим gridColumnCount.
   const clones: (SceneNode | null)[] = [];
   for (let r = 0; r < N; r++) {
     const src = cellByPos.get(`${r},${anchorColIdx}`);
     clones.push(src ? src.clone() : null);
   }
-
-  // Вставляем с конца, чтобы предыдущие индексы оставались валидными
   for (let r = N - 1; r >= 0; r--) {
     const clone = clones[r];
     if (clone) body.insertChild(r * C + newColIdx, clone);
   }
-
   body.gridColumnCount = C + 1;
-
   return clones.filter((c): c is SceneNode => c !== null);
 }
 
@@ -1030,9 +1520,22 @@ function addRowStack(model: TableModel, anchorRowIdx: number, direction: "prev" 
   return [...(newRow as SceneNode & ChildrenMixin).children] as SceneNode[];
 }
 
-// Для GridAutoTracks="ROWS" gridRowCount менять запрещено — но рядов всё равно
-// добавляется автоматически по факту наличия детей. Просто вставляем C клонов
-// подряд по индексу newRowIdx * C — Figma сама создаст новый ряд.
+// Пробуем понять режим грида: FIXED (gridRowCount/Column user-controlled, можно
+// setGridChildPosition) vs AUTO-ROWS (gridRowCount auto, setGridChildPosition
+// бросает). Пробуем no-op setGridChildPosition (ставим ячейку в её же позицию).
+// Если кидает — auto-rows.
+function isGridFixedTracks(model: TableModel): boolean {
+  const cell = model.cells.find((lc) => lc.visible) || model.cells[0];
+  if (!cell) return true;
+  try {
+    (cell.node as unknown as { setGridChildPosition: (r: number, c: number) => void })
+      .setGridChildPosition(cell.rowIdx, cell.colIdx);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function addRowGrid(model: TableModel, anchorRowIdx: number, direction: "prev" | "next"): SceneNode[] {
   const body = model.body as FrameNode;
   const C = body.gridColumnCount;
@@ -1043,6 +1546,34 @@ function addRowGrid(model: TableModel, anchorRowIdx: number, direction: "prev" |
     if (lc.rowIdx === anchorRowIdx) cellByCol.set(lc.colIdx, lc.node);
   }
 
+  if (isGridFixedTracks(model)) {
+    // FIXED треки: явно управляем grid-позициями.
+    // 1) Сдвигаем ячейки с rowIdx >= newRowIdx вниз (по убыванию rowIdx, чтобы не было коллизий).
+    // 2) Бамп gridRowCount.
+    // 3) Клонируем и явно ставим setGridChildPosition.
+    body.gridRowCount = body.gridRowCount + 1;
+    const toShift = [...model.cells]
+      .filter((lc) => lc.rowIdx >= newRowIdx)
+      .sort((a, b) => b.rowIdx - a.rowIdx);
+    for (const lc of toShift) {
+      (lc.node as unknown as { setGridChildPosition: (r: number, c: number) => void })
+        .setGridChildPosition(lc.rowIdx + 1, lc.colIdx);
+    }
+    const newCells: SceneNode[] = [];
+    for (let c = 0; c < C; c++) {
+      const src = cellByCol.get(c);
+      if (!src) continue;
+      const clone = src.clone();
+      body.appendChild(clone);
+      (clone as unknown as { setGridChildPosition: (r: number, c: number) => void })
+        .setGridChildPosition(newRowIdx, c);
+      newCells.push(clone);
+    }
+    return newCells;
+  }
+
+  // AUTO-ROWS: gridRowCount менять нельзя, но Figma сама создаёт ряд по факту
+  // наличия детей. Просто вставляем C клонов подряд по индексу newRowIdx * C.
   const startIdx = newRowIdx * C;
   const newCells: SceneNode[] = [];
   for (let c = 0; c < C; c++) {
@@ -1346,6 +1877,9 @@ function computeNavState(): NavState {
     canAddRowUp: false, canAddRowDown: false,
     canMoveColLeft: false, canMoveColRight: false,
     canMoveRowUp: false, canMoveRowDown: false,
+    canCopyCsv: false,
+    canConvert: false,
+    tableType: null,
   };
 
   const figmaSel = figma.currentPage.selection;
@@ -1353,8 +1887,22 @@ function computeNavState(): NavState {
   const ctx = cacheCtx;
   const hasCell = ctx !== null;
 
-  if (hasCell) state.canSelectAll = true;
+  if (hasCell) {
+    state.canSelectAll = true;
+    state.canConvert = true;
+    state.tableType = ctx!.model.type;
+  }
   if (figmaSel.length > 0) state.canClearSelection = true;
+
+  // Copy CSV доступен когда хотя бы одна ячейка таблицы в effective-выделении.
+  if (ctx) {
+    for (const n of sel) {
+      if (ctx.model.cellByNodeId.has(n.id)) {
+        state.canCopyCsv = true;
+        break;
+      }
+    }
+  }
 
   // Move-кнопки только для stack-таблиц.
   const isGrid = ctx !== null && ctx.model.type === "grid";
@@ -1387,7 +1935,9 @@ function computeNavState(): NavState {
   // Для axis="row" (выделена полная строка) shrink-col не имеет смысла — у строки
   // нет «горизонтального края» который можно было бы обрезать без потери понятия
   // «выделена строка». Симметрично для axis="column".
-  if (anchorState) {
+  // Для cls.mode === "all" (body или вся таблица выделена) shrink отключаем —
+  // единообразно с nav/expand которые тоже заблокированы в этом режиме.
+  if (anchorState && cls.mode !== "all") {
     const axis = anchorState.axis;
     if (anchorState.colIdxs.length >= 2 && axis !== "row") {
       state.canShrinkColLeft = true;
@@ -1455,7 +2005,13 @@ function computeNavState(): NavState {
 }
 
 function pushNavState() {
-  figma.ui.postMessage({ type: "nav-state", ...computeNavState() });
+  const state = computeNavState();
+  // CSV предвычисляется и отправляется в UI вместе со state. Тогда click-handler
+  // по «Копировать в CSV» сможет вызвать document.execCommand('copy') синхронно
+  // в контексте user gesture (иначе async-цепочка ломает activation и copy не
+  // срабатывает).
+  const csv = state.canCopyCsv ? buildCsvFromSelection() : null;
+  figma.ui.postMessage({ type: "nav-state", ...state, csv });
 }
 
 function pushStatusFromSelection() {
@@ -1514,10 +2070,11 @@ const TWO_STEP_ACTIONS = new Set(["nav", "expand", "shrink", "add", "move"]);
 // Маппинг msg.type → обработчик. Возвращает Response или undefined (если
 // сообщение незнакомое).
 const ACTIONS: { [k: string]: (m: UiMessage) => Response } = {
-  "select-row": () => selectRow(),
+  "select-row": (m) => selectRow(m.includeHeader === true),
   "select-column": (m) => selectColumn(m.includeHeader === true),
   "select-all": (m) => selectAll(m.includeHeader === true),
   "clear-selection": () => clearSelection(),
+  "convert": () => convertTable(),
   "toggle-header": (m) => toggleHeader(m.includeHeader === true),
   "nav": (m) => navigate(m.mode!, m.direction!, m.includeHeader === true),
   "expand": (m) => expand(m.mode!, m.direction!, m.includeHeader === true),
