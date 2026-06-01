@@ -7,7 +7,7 @@
     "watch": "tsc -w"
   },
   "devDependencies": {
-    "@figma/plugin-typings": "*",
+    "@figma/plugin-typings": "^1.127.0",
     "typescript": "*"
   }
 }

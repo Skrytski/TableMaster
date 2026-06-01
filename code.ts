@@ -1777,22 +1777,44 @@ function moveColumnStack(model: TableModel, rotation: Map<number, number>): bool
   return true;
 }
 
+// Grid: перемещение через нативный reorderColumns (API 1.127.0+).
+// Каждая наша move-операция выражается одним reorder: блок целиком переезжает
+// на insertionIndex (в координатах исходного порядка треков).
+//   non-wrap next: вставить блок сразу после соседа  → neighborIdx + 1
+//   non-wrap prev: вставить блок прямо перед соседом  → neighborIdx
+//   wrap next:     блок телепортируется в начало      → 0
+//   wrap prev:     блок телепортируется в конец        → gridColumnCount
+function moveColumnGrid(
+  model: TableModel,
+  validate: { blockIdxs: number[]; neighborIdx: number; isWrap: boolean },
+  direction: "prev" | "next",
+): boolean {
+  const body = model.body as FrameNode;
+  const total = body.gridColumnCount;
+  const insertionIndex = !validate.isWrap
+    ? (direction === "next" ? validate.neighborIdx + 1 : validate.neighborIdx)
+    : (direction === "next" ? 0 : total);
+  body.reorderColumns({ fromIndices: validate.blockIdxs, insertionIndex });
+  return true;
+}
+
 function moveColumn(direction: "prev" | "next"): Response {
   const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
-  if (ctx.model.type === "grid") {
-    return { ok: false, message: "Перемещение в grid-таблицах пока не поддерживается" };
-  }
   const cls = classifySelection();
   if (cls.mode !== "column") return { ok: false, message: "Выделите столбец" };
   const validate = validateMoveBlock(cls.colPositions, ctx.model.visibleColIdxs, direction, null);
   if (!validate.ok) return { ok: false, message: "Нельзя двигать" };
 
-  const rotation = validate.isWrap
-    ? buildWrapRotationMap(ctx.model.visibleColIdxs, validate.blockIdxs, direction)
-    : buildRotationMap(validate.blockIdxs, validate.neighborIdx, direction);
-
-  const ok = moveColumnStack(ctx.model, rotation);
+  let ok: boolean;
+  if (ctx.model.type === "grid") {
+    ok = moveColumnGrid(ctx.model, validate, direction);
+  } else {
+    const rotation = validate.isWrap
+      ? buildWrapRotationMap(ctx.model.visibleColIdxs, validate.blockIdxs, direction)
+      : buildRotationMap(validate.blockIdxs, validate.neighborIdx, direction);
+    ok = moveColumnStack(ctx.model, rotation);
+  }
 
   if (!ok) return { ok: false, message: "Не удалось переместить" };
   invalidateModelCache();
@@ -1827,12 +1849,27 @@ function moveRowStack(model: TableModel, rotation: Map<number, number>): boolean
   return true;
 }
 
+// Grid: перемещение строк через нативный reorderRows (API 1.127.0+).
+// Аналогично столбцам, но wrap-next телепортирует блок в начало НЕ-header
+// области (сразу после header), а не в самый верх.
+function moveRowGrid(
+  model: TableModel,
+  validate: { blockIdxs: number[]; neighborIdx: number; isWrap: boolean },
+  direction: "prev" | "next",
+): boolean {
+  const body = model.body as FrameNode;
+  const total = body.gridRowCount;
+  const wrapStart = model.headerRowIdx + 1; // верх не-header области
+  const insertionIndex = !validate.isWrap
+    ? (direction === "next" ? validate.neighborIdx + 1 : validate.neighborIdx)
+    : (direction === "next" ? wrapStart : total);
+  body.reorderRows({ fromIndices: validate.blockIdxs, insertionIndex });
+  return true;
+}
+
 function moveRow(direction: "prev" | "next"): Response {
   const ctx = cacheCtx;
   if (!ctx) return { ok: false, message: "Это не похоже на таблицу" };
-  if (ctx.model.type === "grid") {
-    return { ok: false, message: "Перемещение в grid-таблицах пока не поддерживается" };
-  }
   const cls = classifySelection();
   if (cls.mode !== "row") return { ok: false, message: "Выделите строку" };
 
@@ -1842,16 +1879,20 @@ function moveRow(direction: "prev" | "next"): Response {
   const validate = validateMoveBlock(cls.rowPositions, ctx.model.visibleRowIdxs, direction, skipPos);
   if (!validate.ok) return { ok: false, message: "Нельзя двигать" };
 
-  let rotation: Map<number, number>;
-  if (validate.isWrap) {
-    // При wrap — блок целиком телепортируется на противоположный край цикла (видимые ряды без Header).
-    const cycleIdxs = ctx.model.visibleRowIdxs.filter((idx) => idx !== ctx.model.headerRowIdx);
-    rotation = buildWrapRotationMap(cycleIdxs, validate.blockIdxs, direction);
+  let ok: boolean;
+  if (ctx.model.type === "grid") {
+    ok = moveRowGrid(ctx.model, validate, direction);
   } else {
-    rotation = buildRotationMap(validate.blockIdxs, validate.neighborIdx, direction);
+    let rotation: Map<number, number>;
+    if (validate.isWrap) {
+      // При wrap — блок целиком телепортируется на противоположный край цикла (видимые ряды без Header).
+      const cycleIdxs = ctx.model.visibleRowIdxs.filter((idx) => idx !== ctx.model.headerRowIdx);
+      rotation = buildWrapRotationMap(cycleIdxs, validate.blockIdxs, direction);
+    } else {
+      rotation = buildRotationMap(validate.blockIdxs, validate.neighborIdx, direction);
+    }
+    ok = moveRowStack(ctx.model, rotation);
   }
-
-  const ok = moveRowStack(ctx.model, rotation);
 
   if (!ok) return { ok: false, message: "Не удалось переместить" };
   invalidateModelCache();
@@ -1903,9 +1944,6 @@ function computeNavState(): NavState {
       }
     }
   }
-
-  // Move-кнопки только для stack-таблиц.
-  const isGrid = ctx !== null && ctx.model.type === "grid";
 
   const isHeaderRowIdx = (rowIdx: number): boolean => ctx !== null && rowIdx === ctx.model.headerRowIdx;
 
@@ -1981,17 +2019,16 @@ function computeNavState(): NavState {
   if (cls.mode === "column") {
     state.canAddColLeft = true;
     state.canAddColRight = true;
-    if (!isGrid) {
-      const leftVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "prev", null);
-      const rightVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "next", null);
-      state.canMoveColLeft = leftVal.ok;
-      state.canMoveColRight = rightVal.ok;
-    }
+    // Move работает и для stack, и для grid (grid — через reorderColumns, API 1.127.0+).
+    const leftVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "prev", null);
+    const rightVal = validateMoveBlock(cls.colPositions, ctx!.model.visibleColIdxs, "next", null);
+    state.canMoveColLeft = leftVal.ok;
+    state.canMoveColRight = rightVal.ok;
   } else if (cls.mode === "row") {
     const edges = findEdgeRowIdxs();
     state.canAddRowUp = edges.top !== null && !isHeaderRowIdx(edges.top);
     state.canAddRowDown = edges.bottom !== null && !isHeaderRowIdx(edges.bottom);
-    if (ctx && !isGrid) {
+    if (ctx) {
       const headerPos = ctx.model.visibleRowIdxs.indexOf(ctx.model.headerRowIdx);
       const skipPos = headerPos >= 0 ? headerPos : null;
       const upVal = validateMoveBlock(cls.rowPositions, ctx.model.visibleRowIdxs, "prev", skipPos);
