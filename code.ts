@@ -2073,14 +2073,20 @@ figma.on("selectionchange", () => {
   refreshCache();
   if (!isOurChange) {
     refreshAnchorFromSelection();
-    // Если effective-selection отличается от figma-выделения, значит юзер выделил
-    // row-контейнер. Запоминаем cells для двухшагового коммита по action-кнопке.
-    const eff = effectiveSelection();
-    pendingContainerCells = idsDiffer(eff.map((n) => n.id), currentIds) ? eff : null;
+    recomputePendingContainer(currentIds);
   }
   pushNavState();
   pushStatusFromSelection();
 });
+
+// Если effective-selection отличается от настоящего figma-выделения, значит
+// пользователь выделил row- или body-контейнер. Запоминаем его ячейки для
+// двухшагового коммита по первой action-кнопке. Вызывается и из selectionchange,
+// и из init (чтобы работало даже когда контейнер был выделен ДО открытия плагина).
+function recomputePendingContainer(currentIds: string[]): void {
+  const eff = effectiveSelection();
+  pendingContainerCells = idsDiffer(eff.map((n) => n.id), currentIds) ? eff : null;
+}
 
 function matchesLastPluginSelection(currentIds: string[]): boolean {
   if (lastPluginSelectionIds === null || currentIds.length !== lastPluginSelectionIds.size) return false;
@@ -2126,6 +2132,7 @@ figma.ui.onmessage = async (msg: UiMessage) => {
     figma.ui.postMessage({ type: "init-state", includeHeader: stored === undefined ? true : Boolean(stored) });
     refreshCache();
     refreshAnchorFromSelection();
+    recomputePendingContainer(figma.currentPage.selection.map((n) => n.id));
     pushNavState();
     pushStatusFromSelection();
     return;
