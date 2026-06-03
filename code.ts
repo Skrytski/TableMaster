@@ -1,4 +1,4 @@
-figma.showUI(__html__, { width: 280, height: 700 });
+figma.showUI(__html__, { width: 260, height: 620, themeColors: true });
 
 const MIN_ROWS_FOR_TABLE = 2;
 const MIN_ALIGNED_COLS_FOR_TABLE = 2;

@@ -3,124 +3,158 @@
 <head>
   <meta charset="utf-8" />
   <style>
+    /* Нативный вид Figma: цвета берутся из CSS-переменных --figma-color-*,
+       которые Figma инжектит при showUI({ themeColors: true }). Свет/тьма
+       переключаются автоматически вслед за темой редактора. */
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
-      font-size: 12px;
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 11px;
       margin: 0;
-      padding: 16px;
-      color: #1e1e1e;
+      padding: 8px;
+      background: var(--figma-color-bg);
+      color: var(--figma-color-text);
+      overflow-y: auto;
     }
     h2 {
-      margin: 0 0 12px 0;
-      font-size: 13px;
-      font-weight: 600;
-    }
-    .section-label {
-      margin: 16px 0 8px 0;
+      margin: 2px 4px 8px;
       font-size: 11px;
       font-weight: 600;
-      color: #555;
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
+      color: var(--figma-color-text);
+    }
+    /* Заголовок секции: жирный, тёмный, с тонким разделителем сверху во всю
+       ширину панели — как в нативной панели свойств Figma. */
+    .section-label {
+      margin: 12px -8px 6px;
+      padding: 12px 8px 0;
+      border-top: 1px solid var(--figma-color-border);
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--figma-color-text);
+    }
+    /* Первая секция — без разделителя сверху. */
+    .section-label.first {
+      border-top: none;
+      padding-top: 2px;
+      margin-top: 4px;
     }
     .buttons {
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 4px;
     }
-    button {
-      background: #18a0fb;
-      color: #fff;
-      border: none;
-      border-radius: 6px;
-      padding: 8px 14px;
-      font-size: 12px;
-      font-weight: 500;
-      cursor: pointer;
-      width: 100%;
+    /* Смысловые кнопки: иконка + текст, лёгкая серая заливка как у нативных
+       контролов Figma (без обводки). */
+    .text-btn {
       display: inline-flex;
       align-items: center;
-      justify-content: flex-start;
       gap: 8px;
+      width: 100%;
+      height: 32px;
+      padding: 0 10px;
+      box-sizing: border-box;
+      background: var(--figma-color-bg-secondary);
+      color: var(--figma-color-text);
+      border: none;
+      border-radius: 5px;
+      font-size: 11px;
+      font-family: inherit;
+      cursor: pointer;
+      text-align: left;
+      white-space: nowrap;
     }
-    button:hover:not(:disabled) { background: #0d8de4; }
-    button:active:not(:disabled) { background: #0c7fcc; }
-    button:disabled {
-      background: #e5e5e5;
-      color: #aaa;
-      cursor: not-allowed;
+    .text-btn:hover:not(:disabled) { background: var(--figma-color-bg-hover); }
+    .text-btn:active:not(:disabled) { background: var(--figma-color-bg-active); }
+    .text-btn:disabled {
+      background: var(--figma-color-bg-secondary);
+      color: var(--figma-color-text-disabled);
+      cursor: default;
+    }
+    /* Направленные кнопки: только иконка, 24px, серый фон по наведению. */
+    .icon-row {
+      display: flex;
+      gap: 2px;
+    }
+    .icon-btn {
+      width: 24px;
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      background: transparent;
+      border: none;
+      border-radius: 5px;
+      color: var(--figma-color-icon);
+      cursor: pointer;
+    }
+    .icon-btn:hover:not(:disabled) { background: var(--figma-color-bg-hover); }
+    .icon-btn:active:not(:disabled) { background: var(--figma-color-bg-active); }
+    .icon-btn:disabled {
+      color: var(--figma-color-icon-disabled);
+      cursor: default;
     }
     .btn-icon {
       width: 16px;
       height: 16px;
       fill: currentColor;
       flex-shrink: 0;
+      pointer-events: none;
     }
-    .nav-row {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 6px;
-    }
-    .nav-btn {
-      padding: 8px 0;
-      justify-content: center;
-    }
-    .nav-btn .btn-icon {
-      width: 18px;
-      height: 18px;
-    }
-    .toggle-row {
+    /* Нативный чекбокс Figma: квадрат 14px, по клику — синяя заливка с галочкой. */
+    .checkbox-row {
       display: flex;
       align-items: center;
-      gap: 10px;
-      margin-top: 12px;
+      gap: 8px;
+      margin: 8px 4px 4px;
       user-select: none;
       cursor: pointer;
+      color: var(--figma-color-text);
     }
-    .toggle-row input {
+    .checkbox-row input {
       position: absolute;
       opacity: 0;
       width: 0;
       height: 0;
       pointer-events: none;
     }
-    .toggle-track {
+    .checkbox-box {
       position: relative;
       flex-shrink: 0;
-      width: 28px;
+      width: 16px;
       height: 16px;
-      background: #c4c4c4;
-      border-radius: 8px;
-      transition: background 0.15s ease;
+      box-sizing: border-box;
+      border: 1px solid var(--figma-color-border);
+      border-radius: 4px;
+      background: var(--figma-color-bg-secondary);
+      transition: background 0.1s ease, border-color 0.1s ease;
     }
-    .toggle-thumb {
+    .checkbox-row input:checked ~ .checkbox-box {
+      background: var(--figma-color-bg-brand);
+      border-color: var(--figma-color-bg-brand);
+    }
+    .checkbox-row input:checked ~ .checkbox-box::after {
+      content: "";
       position: absolute;
+      left: 5px;
       top: 2px;
-      left: 2px;
-      width: 12px;
-      height: 12px;
-      background: #fff;
-      border-radius: 50%;
-      box-shadow: 0 1px 2px rgba(0,0,0,0.2);
-      transition: left 0.15s ease;
+      width: 4px;
+      height: 8px;
+      border: solid #fff;
+      border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
     }
-    .toggle-row input:checked ~ .toggle-track {
-      background: #18a0fb;
-    }
-    .toggle-row input:checked ~ .toggle-track .toggle-thumb {
-      left: 14px;
+    .checkbox-row input:focus-visible ~ .checkbox-box {
+      outline: 1px solid var(--figma-color-border-selected, var(--figma-color-bg-brand));
+      outline-offset: 1px;
     }
     #status {
-      margin-top: 12px;
-      padding: 10px;
-      background: #f5f5f5;
-      border-radius: 6px;
-      min-height: 18px;
-      color: #333;
+      margin: 10px 4px 2px;
       font-size: 11px;
+      color: var(--figma-color-text-secondary);
+      min-height: 16px;
+      line-height: 1.4;
     }
-    #status.empty { color: #888; }
-    #status.error { background: #fef0f0; color: #b91c1c; }
+    #status.error { color: var(--figma-color-text-danger); }
   </style>
 </head>
 <body>
@@ -155,72 +189,71 @@
     <symbol id="i-swap-vertical" viewBox="0 0 24 24"><path d="M9,3L5,7H8V14H10V7H13M16,17V10H14V17H11L15,21L19,17H16Z"/></symbol>
   </svg>
 
-  <h2>TableMaster</h2>
-
-  <div class="buttons">
-    <button id="select-row"><svg class="btn-icon"><use href="#i-table-row"/></svg>Выделить строку</button>
-    <button id="select-column"><svg class="btn-icon"><use href="#i-table-column"/></svg>Выделить столбец</button>
-    <button id="select-all" disabled><svg class="btn-icon"><use href="#i-select-all"/></svg>Выделить все ячейки</button>
-    <button id="clear-selection" disabled><svg class="btn-icon"><use href="#i-close"/></svg>Снять выделение</button>
+  <div class="section-label first">Выделение</div>
+  <div class="icon-row">
+    <button class="icon-btn" id="select-row" title="Выделить строку"><svg class="btn-icon"><use href="#i-table-row"/></svg></button>
+    <button class="icon-btn" id="select-column" title="Выделить столбец"><svg class="btn-icon"><use href="#i-table-column"/></svg></button>
+    <button class="icon-btn" id="select-all" disabled title="Выделить все ячейки"><svg class="btn-icon"><use href="#i-select-all"/></svg></button>
+    <button class="icon-btn" id="clear-selection" disabled title="Снять выделение"><svg class="btn-icon"><use href="#i-close"/></svg></button>
   </div>
 
-  <label class="toggle-row">
+  <label class="checkbox-row">
     <input type="checkbox" id="include-header" />
-    <span class="toggle-track"><span class="toggle-thumb"></span></span>
+    <span class="checkbox-box"></span>
     <span>Включать заголовок</span>
   </label>
 
   <div class="section-label">Навигация</div>
-  <div class="nav-row">
-    <button class="nav-btn" id="nav-prev-col" disabled title="Сдвинуть столбец влево"><svg class="btn-icon"><use href="#i-arrow-left"/></svg></button>
-    <button class="nav-btn" id="nav-next-col" disabled title="Сдвинуть столбец вправо"><svg class="btn-icon"><use href="#i-arrow-right"/></svg></button>
-    <button class="nav-btn" id="nav-prev-row" disabled title="Сдвинуть строку вверх"><svg class="btn-icon"><use href="#i-arrow-up"/></svg></button>
-    <button class="nav-btn" id="nav-next-row" disabled title="Сдвинуть строку вниз"><svg class="btn-icon"><use href="#i-arrow-down"/></svg></button>
+  <div class="icon-row">
+    <button class="icon-btn" id="nav-prev-col" disabled title="Сдвинуть столбец влево"><svg class="btn-icon"><use href="#i-arrow-left"/></svg></button>
+    <button class="icon-btn" id="nav-next-col" disabled title="Сдвинуть столбец вправо"><svg class="btn-icon"><use href="#i-arrow-right"/></svg></button>
+    <button class="icon-btn" id="nav-prev-row" disabled title="Сдвинуть строку вверх"><svg class="btn-icon"><use href="#i-arrow-up"/></svg></button>
+    <button class="icon-btn" id="nav-next-row" disabled title="Сдвинуть строку вниз"><svg class="btn-icon"><use href="#i-arrow-down"/></svg></button>
   </div>
 
   <div class="section-label">Расширение</div>
-  <div class="nav-row">
-    <button class="nav-btn" id="exp-col-left" disabled title="Расширить столбцом слева"><svg class="btn-icon"><use href="#i-arrow-expand-left"/></svg></button>
-    <button class="nav-btn" id="exp-col-right" disabled title="Расширить столбцом справа"><svg class="btn-icon"><use href="#i-arrow-expand-right"/></svg></button>
-    <button class="nav-btn" id="exp-row-up" disabled title="Расширить строкой сверху"><svg class="btn-icon"><use href="#i-arrow-expand-up"/></svg></button>
-    <button class="nav-btn" id="exp-row-down" disabled title="Расширить строкой снизу"><svg class="btn-icon"><use href="#i-arrow-expand-down"/></svg></button>
+  <div class="icon-row">
+    <button class="icon-btn" id="exp-col-left" disabled title="Расширить столбцом слева"><svg class="btn-icon"><use href="#i-arrow-expand-left"/></svg></button>
+    <button class="icon-btn" id="exp-col-right" disabled title="Расширить столбцом справа"><svg class="btn-icon"><use href="#i-arrow-expand-right"/></svg></button>
+    <button class="icon-btn" id="exp-row-up" disabled title="Расширить строкой сверху"><svg class="btn-icon"><use href="#i-arrow-expand-up"/></svg></button>
+    <button class="icon-btn" id="exp-row-down" disabled title="Расширить строкой снизу"><svg class="btn-icon"><use href="#i-arrow-expand-down"/></svg></button>
   </div>
 
   <div class="section-label">Сужение</div>
-  <div class="nav-row">
-    <button class="nav-btn" id="shr-col-left" disabled title="Убрать крайний левый столбец из выделения"><svg class="btn-icon"><use href="#i-arrow-collapse-left"/></svg></button>
-    <button class="nav-btn" id="shr-col-right" disabled title="Убрать крайний правый столбец из выделения"><svg class="btn-icon"><use href="#i-arrow-collapse-right"/></svg></button>
-    <button class="nav-btn" id="shr-row-up" disabled title="Убрать верхнюю строку из выделения"><svg class="btn-icon"><use href="#i-arrow-collapse-up"/></svg></button>
-    <button class="nav-btn" id="shr-row-down" disabled title="Убрать нижнюю строку из выделения"><svg class="btn-icon"><use href="#i-arrow-collapse-down"/></svg></button>
+  <div class="icon-row">
+    <button class="icon-btn" id="shr-col-left" disabled title="Убрать крайний левый столбец из выделения"><svg class="btn-icon"><use href="#i-arrow-collapse-left"/></svg></button>
+    <button class="icon-btn" id="shr-col-right" disabled title="Убрать крайний правый столбец из выделения"><svg class="btn-icon"><use href="#i-arrow-collapse-right"/></svg></button>
+    <button class="icon-btn" id="shr-row-up" disabled title="Убрать верхнюю строку из выделения"><svg class="btn-icon"><use href="#i-arrow-collapse-up"/></svg></button>
+    <button class="icon-btn" id="shr-row-down" disabled title="Убрать нижнюю строку из выделения"><svg class="btn-icon"><use href="#i-arrow-collapse-down"/></svg></button>
   </div>
 
   <div class="section-label">Добавить</div>
-  <div class="nav-row">
-    <button class="nav-btn" id="add-col-left" disabled title="Дублировать крайний левый столбец выделения и вставить слева"><svg class="btn-icon"><use href="#i-table-column-plus-before"/></svg></button>
-    <button class="nav-btn" id="add-col-right" disabled title="Дублировать крайний правый столбец выделения и вставить справа"><svg class="btn-icon"><use href="#i-table-column-plus-after"/></svg></button>
-    <button class="nav-btn" id="add-row-up" disabled title="Дублировать верхнюю строку выделения и вставить сверху"><svg class="btn-icon"><use href="#i-table-row-plus-before"/></svg></button>
-    <button class="nav-btn" id="add-row-down" disabled title="Дублировать нижнюю строку выделения и вставить снизу"><svg class="btn-icon"><use href="#i-table-row-plus-after"/></svg></button>
+  <div class="icon-row">
+    <button class="icon-btn" id="add-col-left" disabled title="Дублировать крайний левый столбец выделения и вставить слева"><svg class="btn-icon"><use href="#i-table-column-plus-before"/></svg></button>
+    <button class="icon-btn" id="add-col-right" disabled title="Дублировать крайний правый столбец выделения и вставить справа"><svg class="btn-icon"><use href="#i-table-column-plus-after"/></svg></button>
+    <button class="icon-btn" id="add-row-up" disabled title="Дублировать верхнюю строку выделения и вставить сверху"><svg class="btn-icon"><use href="#i-table-row-plus-before"/></svg></button>
+    <button class="icon-btn" id="add-row-down" disabled title="Дублировать нижнюю строку выделения и вставить снизу"><svg class="btn-icon"><use href="#i-table-row-plus-after"/></svg></button>
   </div>
 
   <div class="section-label">Перемещение</div>
-  <div class="nav-row">
-    <button class="nav-btn" id="move-col-left" disabled title="Поменять столбец местами с соседним слева"><svg class="btn-icon"><use href="#i-table-arrow-left"/></svg></button>
-    <button class="nav-btn" id="move-col-right" disabled title="Поменять столбец местами с соседним справа"><svg class="btn-icon"><use href="#i-table-arrow-right"/></svg></button>
-    <button class="nav-btn" id="move-row-up" disabled title="Поменять строку местами с соседней сверху (не с заголовком)"><svg class="btn-icon"><use href="#i-table-arrow-up"/></svg></button>
-    <button class="nav-btn" id="move-row-down" disabled title="Поменять строку местами с соседней снизу"><svg class="btn-icon"><use href="#i-table-arrow-down"/></svg></button>
+  <div class="icon-row">
+    <button class="icon-btn" id="move-col-left" disabled title="Поменять столбец местами с соседним слева"><svg class="btn-icon"><use href="#i-table-arrow-left"/></svg></button>
+    <button class="icon-btn" id="move-col-right" disabled title="Поменять столбец местами с соседним справа"><svg class="btn-icon"><use href="#i-table-arrow-right"/></svg></button>
+    <button class="icon-btn" id="move-row-up" disabled title="Поменять строку местами с соседней сверху (не с заголовком)"><svg class="btn-icon"><use href="#i-table-arrow-up"/></svg></button>
+    <button class="icon-btn" id="move-row-down" disabled title="Поменять строку местами с соседней снизу"><svg class="btn-icon"><use href="#i-table-arrow-down"/></svg></button>
   </div>
 
   <div class="section-label">Преобразование</div>
   <div class="buttons">
-    <button id="convert" disabled title="Преобразовать таблицу между Stack auto-layout и Grid auto-layout"><svg class="btn-icon"><use href="#i-swap-vertical"/></svg><span id="convert-label">Преобразовать</span></button>
+    <button class="text-btn" id="convert" disabled title="Преобразовать таблицу между Stack auto-layout и Grid auto-layout"><svg class="btn-icon"><use href="#i-swap-vertical"/></svg><span id="convert-label">Преобразовать</span></button>
   </div>
 
   <div class="section-label">Экспорт</div>
   <div class="buttons">
-    <button id="copy-csv" disabled title="Скопировать значения выделенных ячеек в буфер обмена как CSV"><svg class="btn-icon"><use href="#i-content-copy"/></svg>Копировать в CSV</button>
+    <button class="text-btn" id="copy-csv" disabled title="Скопировать значения выделенных ячеек в буфер обмена как CSV"><svg class="btn-icon"><use href="#i-content-copy"/></svg>Копировать в CSV</button>
   </div>
 
-  <div id="status" class="empty">Выделите ячейку таблицы</div>
+  <div id="status">Выделите ячейку таблицы</div>
 
   <script>
     const btnRow = document.getElementById('select-row');
@@ -313,7 +346,6 @@
     btnCopyCsv.addEventListener('click', () => {
       if (!pendingCsv) {
         status.textContent = 'Нет выделенных ячеек';
-        status.classList.remove('empty');
         status.classList.add('error');
         return;
       }
@@ -321,10 +353,9 @@
       if (ok) {
         const lines = pendingCsv.split('\n').length;
         status.textContent = 'CSV скопирован: ' + lines + (lines === 1 ? ' строка' : ' строк');
-        status.classList.remove('empty', 'error');
+        status.classList.remove('error');
       } else {
         status.textContent = 'Не удалось записать в буфер обмена';
-        status.classList.remove('empty');
         status.classList.add('error');
       }
     });
@@ -336,7 +367,7 @@
 
       if (msg.type === 'status') {
         status.textContent = msg.message;
-        status.classList.remove('empty', 'error');
+        status.classList.remove('error');
         if (!msg.ok) status.classList.add('error');
       } else if (msg.type === 'nav-state') {
         navPrevCol.disabled = !msg.canPrevCol;
