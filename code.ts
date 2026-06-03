@@ -217,10 +217,28 @@ function computeStackModel(body: BaseNode & ChildrenMixin): TableModel | null {
     }
   }
   const sortedXs = [...xByRounded.values()].sort((a, b) => a - b);
-  const colIdxByRounded = new Map<number, number>();
-  for (let i = 0; i < sortedXs.length; i++) {
-    colIdxByRounded.set(Math.round(sortedXs[i]), i);
+
+  // Сопоставление ячейки со столбцом по БЛИЖАЙШЕМУ X-якорю (а не точному
+  // совпадению). Это ловит шапки/строки с чуть иной шириной колонок — например
+  // когда у шапки колонка 315px, а у строк данных 330px: X-позиции не совпадают
+  // точно, но ячейка очевидно принадлежит тому же столбцу. Порог — половина
+  // минимального расстояния между соседними столбцами, чтобы не «притянуть»
+  // действительно посторонние ячейки.
+  let minGap = Infinity;
+  for (let i = 1; i < sortedXs.length; i++) {
+    minGap = Math.min(minGap, sortedXs[i] - sortedXs[i - 1]);
   }
+  const colMatchThreshold = minGap === Infinity ? 0.5 : minGap / 2;
+
+  const nearestColIdx = (x: number): number | undefined => {
+    let best = -1;
+    let bestDist = Infinity;
+    for (let i = 0; i < sortedXs.length; i++) {
+      const d = Math.abs(sortedXs[i] - x);
+      if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return bestDist <= colMatchThreshold ? best : undefined;
+  };
 
   // Построение LogicalCell
   const cells: LogicalCell[] = [];
@@ -230,9 +248,14 @@ function computeStackModel(body: BaseNode & ChildrenMixin): TableModel | null {
   for (let rowIdx = 0; rowIdx < validRows.length; rowIdx++) {
     const cand = validRows[rowIdx];
     rowNodeByIdx.set(rowIdx, cand.rowNode);
+    const usedColInRow = new Set<number>();
     for (const cell of cand.cells) {
-      const colIdx = colIdxByRounded.get(Math.round(cell.x));
+      const colIdx = nearestColIdx(cell.x);
       if (colIdx === undefined) continue;
+      // Если в этом ряду на данный столбец уже легла ячейка — не накладываем
+      // вторую (защита от редкого случая, когда две ячейки ближе к одному якорю).
+      if (usedColInRow.has(colIdx)) continue;
+      usedColInRow.add(colIdx);
       const lc: LogicalCell = {
         node: cell.node,
         rowIdx,
